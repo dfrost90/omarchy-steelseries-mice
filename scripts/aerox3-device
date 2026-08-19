@@ -91,6 +91,31 @@ def hidraw_nodes():
     return nodes
 
 
+def sensitivity_payload(presets, selected):
+    """Build the sensitivity command, selecting `selected` (0-based).
+
+    rivalcfg encodes the DPI codes correctly, but its Aerox 3 profile declares
+    `first_preset: 1` and adds that to the selection. The device counts from 0,
+    so every selection landed one preset too high, and selecting the last
+    preset produced a byte one past the end that the device silently ignored —
+    the DPI simply never changed.
+
+    Verified on hardware: a raw 0x00 makes the mouse report index 0 and 0x02
+    reports index 2. Only the selection byte is corrected here; the DPI codes
+    still come from rivalcfg's own table.
+    """
+    from rivalcfg.devices import aerox3
+    from rivalcfg.handlers import multidpi_range_choice
+
+    setting = aerox3.profile["settings"]["sensitivity"]
+    # 0 is always a valid selection, so this passes rivalcfg's own range check;
+    # the byte it produces is then overwritten with the device's numbering.
+    data = list(multidpi_range_choice.process_value(setting, ",".join(str(p) for p in presets), 0))
+    data[1] = selected
+
+    return list(setting["command"]) + data
+
+
 def open_mouse():
     import rivalcfg
 
@@ -104,14 +129,24 @@ def cmd_presets(argv):
     if len(argv) < 2:
         raise SystemExit("usage: aerox3-device presets <csv> <selected> [--save]")
 
-    presets, selected = argv[0], int(argv[1])
+    presets = [int(p) for p in argv[0].split(",")]
+    selected = int(argv[1])
     # Selection changes happen every time a preset is clicked; persisting each
     # one to the device's flash would wear it for no benefit, since startup
     # re-asserts the state anyway.
     save = "--save" in argv[2:]
 
+    from rivalcfg.devices import aerox3
+
+    setting = aerox3.profile["settings"]["sensitivity"]
     mouse = open_mouse()
-    mouse.set_sensitivity(presets, selected)
+    # Written directly rather than through set_sensitivity, so the corrected
+    # selection byte in sensitivity_payload survives.
+    mouse._hid_write(
+        report_type=setting["report_type"],
+        data=sensitivity_payload(presets, selected),
+        packet_length=setting.get("packet_length", 0),
+    )
     if save:
         mouse.save()
 

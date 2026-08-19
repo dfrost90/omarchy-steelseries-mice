@@ -78,6 +78,22 @@ ad 03 01 12 1b 24 ...
 DPI codes are decoded by inverting rivalcfg's own `output_choices` table, so
 the decode cannot drift from the encode.
 
+### The selected-preset byte is 0-based
+
+rivalcfg's Aerox 3 profile declares `first_preset: 1`, so `process_value` adds
+one to the selection. The device counts presets from 0, which means every
+selection made through `set_sensitivity()` lands one preset too high — and
+selecting the *last* preset produces a byte one past the end that the device
+silently discards, so the DPI never changes at all.
+
+Verified against hardware by writing raw payloads: byte `0x00` makes the mouse
+report index 0, `0x02` reports index 2, and rivalcfg's `0x03` for the last of
+three presets produces no response whatsoever.
+
+`sensitivity_payload()` therefore takes the DPI codes from rivalcfg and
+overwrites only that one byte. This looks like an upstream bug rather than
+something specific to this plugin.
+
 Consequently, before the first write or button press the state is unknown, and
 the panel says "Assumed" rather than presenting a default as fact.
 

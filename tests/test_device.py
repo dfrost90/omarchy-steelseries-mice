@@ -75,5 +75,45 @@ check(
     device.decode_report(report("ad 01 00 13" + " 00" * 60)),
 )
 
+
+# --- outgoing payload ------------------------------------------------------
+#
+# The device numbers the selected preset from 0, but rivalcfg's profile
+# declares first_preset: 1 and adds it. Verified against hardware: writing
+# byte 0x00 makes the mouse report index 0, and 0x02 reports index 2, while
+# the byte rivalcfg would send for the last of three presets (0x03) is out of
+# range and silently discarded.
+def payload_hex(presets, selected):
+    return " ".join("%02x" % b for b in device.sensitivity_payload(presets, selected))
+
+
+check(
+    "the first preset is selected with a zero byte",
+    "2d 03 00 12 1b 24",
+    payload_hex([800, 1200, 1600], 0),
+)
+check(
+    "the last preset is selected in range, not one past the end",
+    "2d 03 02 12 1b 24",
+    payload_hex([800, 1200, 1600], 2),
+)
+check(
+    "a middle preset selects itself",
+    "2d 03 01 12 1b 24",
+    payload_hex([800, 1200, 1600], 1),
+)
+check(
+    "a single-preset table encodes one code and selects it",
+    "2d 01 00 12",
+    payload_hex([800], 0),
+)
+check(
+    "the payload round-trips through the decoder",
+    {"selected": 2, "presets": [800, 1200, 1600]},
+    device.decode_report(
+        bytes([device.REPORT_ID]) + bytes(device.sensitivity_payload([800, 1200, 1600], 2)[1:])
+    ),
+)
+
 print(f"\n{passed} passed, {failed} failed")
 sys.exit(1 if failed else 0)
