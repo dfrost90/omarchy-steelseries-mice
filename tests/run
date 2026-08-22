@@ -1,16 +1,39 @@
 #!/usr/bin/env bash
-# Tests for the aerox3 wrapper script.
+# Tests for the steelseries wrapper script.
 #
-# The device helper is stubbed so no HID writes happen. The stub records the
-# exact argv it was called with, which is what most of these assertions read.
+# The device helper is stubbed so no HID writes happen, and sysfs is faked so
+# the tests can pretend any mouse is plugged in. The stub records the exact
+# argv it was called with, which is what most of these assertions read; it also
+# serves whatever capabilities the test asked for, which is how one suite
+# covers devices nobody here owns.
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-AEROX3="$SCRIPT_DIR/scripts/aerox3"
+STEELSERIES="$SCRIPT_DIR/scripts/steelseries"
 
 pass=0
 fail=0
+
+# The Aerox 3: a preset table of 1-5, a selectable active preset, and a DPI
+# range. This is the shape every unqualified test below runs against.
+CAPS_TABLE='{"connected":true,"device":"1038:1836","name":"SteelSeries Aerox 3",
+  "mode":"table","dpiMin":200,"dpiMax":8500,"dpiStep":100,"dpiValues":[],
+  "presetMin":1,"presetMax":5,"selectable":true,"tracking":true,"verified":true,
+  "pollingOptions":[125,250,500,1000],"defaultPolling":1000,"defaultPresets":[800,1600]}'
+
+# An Aerox 5 Wireless: same shape, wider range, finer minimum.
+CAPS_WIDE='{"connected":true,"device":"1038:1854","name":"SteelSeries Aerox 5 Wireless",
+  "mode":"table","dpiMin":100,"dpiMax":18000,"dpiStep":100,"dpiValues":[],
+  "presetMin":1,"presetMax":5,"selectable":true,"tracking":true,"verified":false,
+  "pollingOptions":[125,250,500,1000],"defaultPolling":1000,"defaultPresets":[400,800,1200,2400,3200]}'
+
+# A Kinzu v2: two fixed slots, no selection byte, and only four legal DPI
+# values with nothing in between.
+CAPS_PAIR='{"connected":true,"device":"1038:1366","name":"SteelSeries Kinzu v2",
+  "mode":"pair","dpiMin":400,"dpiMax":3200,"dpiStep":0,"dpiValues":[400,800,1600,3200],
+  "presetMin":2,"presetMax":2,"selectable":false,"tracking":false,"verified":false,
+  "pollingOptions":[125,500,1000],"defaultPolling":1000,"defaultPresets":[800,3200]}'
 
 setup() {
   SANDBOX="$(mktemp -d)"
@@ -18,22 +41,51 @@ setup() {
   mkdir -p "$STUB_BIN"
 
   DEVICE_LOG="$SANDBOX/device.log"
+  CAPS_LOG="$SANDBOX/caps.log"
+  CAPS_FILE="$SANDBOX/caps.json"
   DEVICE_EXIT=0
+  printf '%s' "$CAPS_TABLE" >"$CAPS_FILE"
 
-  cat >"$STUB_BIN/aerox3-device" <<'STUB'
+  # Faked sysfs. The script reads these to decide, cheaply, whether asking the
+  # helper anything is worthwhile.
+  HIDRAW="$SANDBOX/hidraw"
+  mkdir -p "$HIDRAW/hidraw0/device"
+  printf 'DRIVER=hid-generic\nHID_ID=0003:00001038:00001836\n' \
+    >"$HIDRAW/hidraw0/device/uevent"
+
+  cat >"$STUB_BIN/steelseries-device" <<'STUB'
 #!/usr/bin/env bash
+if [ "${1:-}" = capabilities ]; then
+  printf 'capabilities\n' >>"$CAPS_LOG"
+  cat "$CAPS_FILE"
+  exit 0
+fi
 printf '%s\n' "$*" >>"$DEVICE_LOG"
 [ -n "${DEVICE_STDERR:-}" ] && printf '%s\n' "$DEVICE_STDERR" >&2
 [ -n "${DEVICE_STDOUT:-}" ] && printf '%s\n' "$DEVICE_STDOUT"
 exit "${DEVICE_EXIT:-0}"
 STUB
-  chmod +x "$STUB_BIN/aerox3-device"
+  chmod +x "$STUB_BIN/steelseries-device"
 
   STATE_FILE="$SANDBOX/state.json"
 
-  export DEVICE_LOG DEVICE_EXIT
-  export AEROX3_STATE_FILE="$STATE_FILE"
-  export AEROX3_DEVICE="$STUB_BIN/aerox3-device"
+  export DEVICE_LOG CAPS_LOG CAPS_FILE DEVICE_EXIT
+  export STEELSERIES_STATE_FILE="$STATE_FILE"
+  export STEELSERIES_HIDRAW_DIR="$HIDRAW"
+  export STEELSERIES_DEVICE="$STUB_BIN/steelseries-device"
+}
+
+# Pretend a different mouse is plugged in.
+use_device() {
+  printf '%s' "$1" >"$CAPS_FILE"
+  local ident
+  ident=$(jq -r .device <<<"$1")
+  printf 'DRIVER=hid-generic\nHID_ID=0003:0000%s:0000%s\n' \
+    "${ident%%:*}" "${ident##*:}" >"$HIDRAW/hidraw0/device/uevent"
+}
+
+unplug() {
+  rm -f "$HIDRAW/hidraw0/device/uevent"
 }
 
 teardown() {
@@ -66,281 +118,331 @@ check_contains() {
 # --- writing the preset table ----------------------------------------------
 
 setup
-"$AEROX3" set --presets 800,1200,1600 >/dev/null 2>&1
+"$STEELSERIES" set --presets 800,1200,1600 >/dev/null 2>&1
 check "set --presets writes the table with the first preset selected" \
   "presets 800,1200,1600 0 --save" \
   "$(cat "$DEVICE_LOG" 2>/dev/null)"
 teardown
 
 setup
-"$AEROX3" set --presets 800,1200,1600 --selected 2 >/dev/null 2>&1
+"$STEELSERIES" set --presets 800,1200,1600 --selected 2 >/dev/null 2>&1
 check "set --presets honours an explicit selection" \
   "presets 800,1200,1600 2 --save" \
   "$(cat "$DEVICE_LOG" 2>/dev/null)"
 teardown
 
 setup
-"$AEROX3" set --presets 1637,2350 >/dev/null 2>&1
-check "preset values round to the nearest 100" \
+"$STEELSERIES" set --presets 1637,2350 >/dev/null 2>&1
+check "preset values round to the nearest step" \
   "presets 1600,2400 0 --save" \
   "$(cat "$DEVICE_LOG" 2>/dev/null)"
 teardown
 
 setup
-"$AEROX3" set --presets 50,99999 >/dev/null 2>&1
-check "preset values clamp to the device range" \
+"$STEELSERIES" set --presets 50,99999 >/dev/null 2>&1
+check "preset values clamp to the device's range" \
   "presets 200,8500 0 --save" \
   "$(cat "$DEVICE_LOG" 2>/dev/null)"
 teardown
 
 setup
-out="$("$AEROX3" set --presets 800,900,1000,1100,1200,1300 2>&1)"
-rc=$?
-check "more than five presets is rejected" "1" "$rc"
-check "an over-long preset list never reaches the device" "" "$(cat "$DEVICE_LOG" 2>/dev/null)"
-check_contains "the five-preset limit is explained" "5" "$out"
-teardown
-
-# The device must always hold at least one preset: a table of zero would
-# leave the mouse with no sensitivity at all, and the panel hides its remove
-# control at one row for the same reason.
-setup
-out="$("$AEROX3" set --presets "" 2>&1)"
-rc=$?
-check "an empty preset list is rejected" "1" "$rc"
+out="$("$STEELSERIES" set --presets 800,900,1000,1100,1200,1300 2>&1)"
+check "a table longer than the device holds is rejected" \
+  "" "$(cat "$DEVICE_LOG" 2>/dev/null)"
+check_contains "the too-long table explains the limit" "at most 5" "$out"
 teardown
 
 setup
-out="$("$AEROX3" set --presets "   " 2>&1)"
-rc=$?
-check "a whitespace-only preset list is rejected" "1" "$rc"
-check "a whitespace-only preset list never reaches the device" "" "$(cat "$DEVICE_LOG" 2>/dev/null)"
+out="$("$STEELSERIES" set --presets "800," 2>&1)"
+check "a trailing comma does not silently shrink the table" \
+  "" "$(cat "$DEVICE_LOG" 2>/dev/null)"
+check_contains "the trailing comma is explained" "empty or non-numeric" "$out"
 teardown
 
 setup
-out="$("$AEROX3" set --presets ",," 2>&1)"
-rc=$?
-check "a separator-only preset list is rejected" "1" "$rc"
-check_contains "an empty preset value is named as such" "empty" "$out"
+out="$("$STEELSERIES" set --presets "800,abc" 2>&1)"
+check_contains "a non-numeric preset is rejected" "empty or non-numeric" "$out"
 teardown
 
 setup
-"$AEROX3" set --presets 800,1200 >/dev/null 2>&1
-out="$("$AEROX3" set --presets "800," 2>&1)"
-rc=$?
-check "a trailing separator is rejected rather than silently dropped" "1" "$rc"
-check "the stored table survives a rejected edit" \
-  "800,1200" "$("$AEROX3" get | jq -r '.presets | join(",")')"
+out="$("$STEELSERIES" set --polling 500 --selected 1 2>&1)"
+check_contains "--selected without a table is rejected" "only makes sense" "$out"
 teardown
 
-setup
-out="$("$AEROX3" set --presets 800,abc 2>&1)"
-rc=$?
-check "a non-numeric preset is rejected" "1" "$rc"
-check "a non-numeric preset never reaches the device" "" "$(cat "$DEVICE_LOG" 2>/dev/null)"
-teardown
+# --- capabilities drive the limits -----------------------------------------
 
 setup
-out="$("$AEROX3" set --presets 800,1200 --selected 5 2>&1)"
-rc=$?
-check "a selection outside the table is rejected" "1" "$rc"
-check "an out-of-range selection never reaches the device" "" "$(cat "$DEVICE_LOG" 2>/dev/null)"
-teardown
-
-# --- switching the active preset -------------------------------------------
-
-setup
-"$AEROX3" set --presets 800,1200,1600 >/dev/null 2>&1
-: >"$DEVICE_LOG"
-"$AEROX3" select 2 >/dev/null 2>&1
-check "select rewrites the same table with the new selection" \
-  "presets 800,1200,1600 2 --no-save" \
+use_device "$CAPS_WIDE"
+"$STEELSERIES" set --presets 12000,50 >/dev/null 2>&1
+check "a wider device accepts DPI the Aerox 3 would clamp" \
+  "presets 12000,100 0 --save" \
   "$(cat "$DEVICE_LOG" 2>/dev/null)"
 teardown
 
 setup
-"$AEROX3" set --presets 800,1200,1600 >/dev/null 2>&1
-"$AEROX3" select 2 >/dev/null 2>&1
-check "select updates the stored selection" "2" "$("$AEROX3" get | jq -r .selected)"
-check "select leaves the stored table alone" \
-  "800,1200,1600" "$("$AEROX3" get | jq -r '.presets | join(",")')"
+use_device "$CAPS_WIDE"
+check "the DPI range is reported from the device profile" \
+  "100 18000" \
+  "$("$STEELSERIES" get | jq -r '"\(.dpiMin) \(.dpiMax)"')"
 teardown
 
 setup
-"$AEROX3" set --presets 800,1200 >/dev/null 2>&1
-out="$("$AEROX3" select 7 2>&1)"
-rc=$?
-check "selecting a preset that does not exist is rejected" "1" "$rc"
-teardown
-
-# --- active DPI ------------------------------------------------------------
-
-setup
-"$AEROX3" set --presets 800,1200,1600 --selected 1 >/dev/null 2>&1
-check "get reports the selected preset's DPI as the active one" \
-  "1200" "$("$AEROX3" get | jq -r .activeDpi)"
+use_device "$CAPS_PAIR"
+"$STEELSERIES" set --presets 900,3000 >/dev/null 2>&1
+check "a device with fixed DPI values snaps to the nearest one" \
+  "pair 800 3200" \
+  "$(cat "$DEVICE_LOG" 2>/dev/null)"
 teardown
 
 setup
-check "get falls back to the device default table" \
-  "800,1600" "$("$AEROX3" get | jq -r '.presets | join(",")')"
-check "get flags the fallback table as assumed" "true" "$("$AEROX3" get | jq -r .assumed)"
+use_device "$CAPS_PAIR"
+out="$("$STEELSERIES" set --presets 800,1600,3200 2>&1)"
+check "a fixed-slot device rejects a third slot" \
+  "" "$(cat "$DEVICE_LOG" 2>/dev/null)"
+check_contains "the extra slot is explained" "at most 2" "$out"
 teardown
 
 setup
-"$AEROX3" set --presets 800,1200,1600 >/dev/null 2>&1
-check "get reports state as known once a table was applied" \
-  "false" "$("$AEROX3" get | jq -r .assumed)"
+use_device "$CAPS_PAIR"
+out="$("$STEELSERIES" set --presets 800 2>&1)"
+check_contains "a fixed-slot device rejects a single slot" "at least 2" "$out"
+teardown
+
+setup
+use_device "$CAPS_PAIR"
+out="$("$STEELSERIES" select 1 2>&1)"
+check "a device with no selection byte is never sent one" \
+  "" "$(cat "$DEVICE_LOG" 2>/dev/null)"
+check_contains "the missing selection is explained" "fixed DPI slots" "$out"
+teardown
+
+setup
+use_device "$CAPS_PAIR"
+check "polling options come from the device profile" \
+  "125 500 1000" \
+  "$("$STEELSERIES" get | jq -r '.pollingOptions | join(" ")')"
+teardown
+
+setup
+use_device "$CAPS_PAIR"
+out="$("$STEELSERIES" set --polling 250 2>&1)"
+check_contains "a polling rate the device lacks is rejected" "must be one of" "$out"
 teardown
 
 # --- polling rate ----------------------------------------------------------
 
 setup
-"$AEROX3" set --polling 500 >/dev/null 2>&1
-check "set --polling forwards the rate to the device" \
-  "polling 500" \
+"$STEELSERIES" set --polling 500 >/dev/null 2>&1
+check "set --polling forwards the rate" "polling 500" "$(cat "$DEVICE_LOG" 2>/dev/null)"
+teardown
+
+setup
+out="$("$STEELSERIES" set --polling 333 2>&1)"
+check "an unsupported polling rate never reaches the device" \
+  "" "$(cat "$DEVICE_LOG" 2>/dev/null)"
+check_contains "the unsupported rate is explained" "must be one of" "$out"
+teardown
+
+# --- selecting a preset ----------------------------------------------------
+
+setup
+"$STEELSERIES" set --presets 800,1200,1600 >/dev/null 2>&1
+: >"$DEVICE_LOG"
+"$STEELSERIES" select 2 >/dev/null 2>&1
+check "select rewrites the table without persisting it" \
+  "presets 800,1200,1600 2 --no-save" \
   "$(cat "$DEVICE_LOG" 2>/dev/null)"
 teardown
 
 setup
-out="$("$AEROX3" set --polling 333 2>&1)"
-rc=$?
-check "an unsupported polling rate is rejected" "1" "$rc"
-check "an unsupported polling rate never reaches the device" "" "$(cat "$DEVICE_LOG" 2>/dev/null)"
-check_contains "the valid polling rates are listed" "125" "$out"
-teardown
-
-setup
-"$AEROX3" set --presets 800,1200 >/dev/null 2>&1
-"$AEROX3" set --polling 250 >/dev/null 2>&1
-check "setting the polling rate preserves the preset table" \
-  "800,1200" "$("$AEROX3" get | jq -r '.presets | join(",")')"
-teardown
-
-# --- observing the physical DPI button -------------------------------------
-
-setup
-"$AEROX3" set --presets 800,1200,1600 >/dev/null 2>&1
-"$AEROX3" observe 2 >/dev/null 2>&1
-check "observe records a selection the mouse reported" \
-  "2" "$("$AEROX3" get | jq -r .selected)"
-teardown
-
-setup
-"$AEROX3" set --presets 800,1200,1600 >/dev/null 2>&1
+"$STEELSERIES" set --presets 800,1200 >/dev/null 2>&1
 : >"$DEVICE_LOG"
-"$AEROX3" observe 2 >/dev/null 2>&1
-check "observe never writes back to the device" "" "$(cat "$DEVICE_LOG" 2>/dev/null)"
+out="$("$STEELSERIES" select 4 2>&1)"
+check "selecting a preset that does not exist writes nothing" \
+  "" "$(cat "$DEVICE_LOG" 2>/dev/null)"
+check_contains "the missing preset is explained" "does not exist" "$out"
 teardown
 
 setup
-"$AEROX3" set --presets 800,1200,1600 >/dev/null 2>&1
-"$AEROX3" observe 1 --presets 400,900 >/dev/null 2>&1
-check "observe adopts a table that disagrees with ours" \
-  "400,900" "$("$AEROX3" get | jq -r '.presets | join(",")')"
-check "observe adopting a table keeps its reported selection" \
-  "1" "$("$AEROX3" get | jq -r .selected)"
+out="$("$STEELSERIES" select 2>&1)"
+check_contains "select without an index is rejected" "needs a preset index" "$out"
+teardown
+
+# --- observing the physical button -----------------------------------------
+
+setup
+"$STEELSERIES" observe 1 --presets 800,1600,3200 >/dev/null 2>&1
+check "observe records the report without writing to the device" \
+  "" "$(cat "$DEVICE_LOG" 2>/dev/null)"
 teardown
 
 setup
-out="$("$AEROX3" observe 9 2>&1)"
-rc=$?
-check "observe rejects a selection outside the known table" "1" "$rc"
+"$STEELSERIES" observe 2 --presets 800,1600,3200 >/dev/null 2>&1
+check "observe replaces the stored table with what the device reported" \
+  "800 1600 3200 2" \
+  "$("$STEELSERIES" get | jq -r '"\(.presets | join(" ")) \(.selected)"')"
 teardown
 
-# --- apply -----------------------------------------------------------------
+setup
+"$STEELSERIES" observe 0 --presets 800,1600 >/dev/null 2>&1
+check "an observed state is no longer assumed" \
+  "false" "$("$STEELSERIES" get | jq -r .assumed)"
+teardown
+
+# --- re-asserting on startup -----------------------------------------------
 
 setup
-"$AEROX3" set --presets 800,1200,1600 --selected 1 >/dev/null 2>&1
+"$STEELSERIES" apply >/dev/null 2>&1
+check "apply writes nothing when nothing has ever been applied" \
+  "" "$(cat "$DEVICE_LOG" 2>/dev/null)"
+teardown
+
+setup
+"$STEELSERIES" set --presets 800,1200 --selected 1 >/dev/null 2>&1
 : >"$DEVICE_LOG"
-"$AEROX3" apply >/dev/null 2>&1
-check "apply re-asserts the stored table and selection without saving" \
-  "presets 800,1200,1600 1 --no-save
+"$STEELSERIES" apply >/dev/null 2>&1
+check "apply re-asserts the stored table without persisting it" \
+  "presets 800,1200 1 --no-save
 polling 1000" \
   "$(cat "$DEVICE_LOG" 2>/dev/null)"
 teardown
 
 setup
-"$AEROX3" apply >/dev/null 2>&1
-check "apply with nothing stored does nothing" "" "$(cat "$DEVICE_LOG" 2>/dev/null)"
+printf '{"presets":[800,1600],"selected":0,"appliedAt":"2026-01-01T00:00:00+00:00"}' >"$STATE_FILE"
+"$STEELSERIES" apply >/dev/null 2>&1
+check "a state file from an older format is not asserted onto the mouse" \
+  "" "$(cat "$DEVICE_LOG" 2>/dev/null)"
+teardown
+
+setup
+printf '{"version":1,"presets":[800,1600],"appliedAt":"2026-01-01T00:00:00+00:00"}' >"$STATE_FILE"
+check "an older state file leaves the state assumed" \
+  "true" "$("$STEELSERIES" get | jq -r .assumed)"
+teardown
+
+# --- state file ------------------------------------------------------------
+
+setup
+"$STEELSERIES" set --presets 800,1200,1600 --selected 1 >/dev/null 2>&1
+check "state is stored under the device it belongs to" \
+  "800 1200 1600" \
+  "$(jq -r '.devices["1038:1836"].presets | join(" ")' "$STATE_FILE")"
+teardown
+
+setup
+"$STEELSERIES" set --presets 800,1200 >/dev/null 2>&1
+use_device "$CAPS_PAIR"
+"$STEELSERIES" set --presets 400,1600 >/dev/null 2>&1
+check "swapping mice does not discard what we knew about the first" \
+  "800 1200" \
+  "$(jq -r '.devices["1038:1836"].presets | join(" ")' "$STATE_FILE")"
+check "each mouse keeps its own table" \
+  "400 1600" \
+  "$(jq -r '.devices["1038:1366"].presets | join(" ")' "$STATE_FILE")"
+teardown
+
+setup
+printf '{"version":2,"devices":{"1038:1836":{"presets":[800,1200],"selected":9}}}' >"$STATE_FILE"
+check "a stored selection past the end of the table is clamped" \
+  "1" "$("$STEELSERIES" get | jq -r .selected)"
+teardown
+
+setup
+"$STEELSERIES" get >/dev/null 2>&1
+"$STEELSERIES" set --presets 800,1200 >/dev/null 2>&1
+: >"$CAPS_LOG"
+"$STEELSERIES" get >/dev/null 2>&1
+"$STEELSERIES" get >/dev/null 2>&1
+check "capabilities are cached rather than re-derived on every call" \
+  "0" "$(wc -l <"$CAPS_LOG")"
+teardown
+
+setup
+"$STEELSERIES" set --presets 800,1200 >/dev/null 2>&1
+use_device "$CAPS_PAIR"
+: >"$CAPS_LOG"
+"$STEELSERIES" get >/dev/null 2>&1
+check "plugging in a different mouse re-derives its capabilities" \
+  "1" "$(wc -l <"$CAPS_LOG")"
+teardown
+
+# --- nothing plugged in ----------------------------------------------------
+
+setup
+unplug
+check "an unplugged mouse reports itself disconnected" \
+  "false" "$("$STEELSERIES" get | jq -r .connected)"
+teardown
+
+setup
+unplug
+check "an unplugged mouse still emits a complete object" \
+  "ok" "$("$STEELSERIES" get | jq -e '.presets and .polling and has("assumed")' >/dev/null 2>&1 && echo ok)"
+teardown
+
+setup
+unplug
+: >"$CAPS_LOG"
+"$STEELSERIES" get >/dev/null 2>&1
+check "an unplugged mouse costs no helper process at all" \
+  "0" "$(wc -l <"$CAPS_LOG")"
+teardown
+
+setup
+unplug
+out="$("$STEELSERIES" set --presets 800,1600 2>&1)"
+check "writing with nothing plugged in touches no device" \
+  "" "$(cat "$DEVICE_LOG" 2>/dev/null)"
+check_contains "the missing mouse is explained" "no supported SteelSeries mouse" "$out"
 teardown
 
 # --- failures --------------------------------------------------------------
 
 setup
-export DEVICE_EXIT=1
-export DEVICE_STDERR="Device not found"
-out="$("$AEROX3" set --presets 800 2>&1)"
-rc=$?
-check "a failed write exits non-zero" "1" "$rc"
+DEVICE_EXIT=1 DEVICE_STDERR="rivalcfg exploded" \
+  "$STEELSERIES" set --presets 800,1200 >/dev/null 2>&1
+check "a failed write is recorded rather than swallowed" \
+  "rivalcfg exploded" "$("$STEELSERIES" get | jq -r .error)"
 teardown
 
 setup
-"$AEROX3" set --presets 800,1200 >/dev/null 2>&1
-export DEVICE_EXIT=1
-"$AEROX3" set --presets 3200 >/dev/null 2>&1
-check "a failed write does not overwrite the last known good table" \
-  "800,1200" "$("$AEROX3" get | jq -r '.presets | join(",")')"
+DEVICE_EXIT=1 DEVICE_STDERR="rivalcfg exploded" \
+  "$STEELSERIES" set --presets 3200,6400 >/dev/null 2>&1
+check "a failed write leaves the previously known table alone" \
+  "800 1600" "$("$STEELSERIES" get | jq -r '.presets | join(" ")')"
 teardown
 
 setup
-export DEVICE_EXIT=1
-export DEVICE_STDERR="Device not found"
-check "get surfaces the last error" \
-  "Device not found" \
-  "$("$AEROX3" set --presets 800 >/dev/null 2>&1; "$AEROX3" get | jq -r .error)"
-teardown
-
-setup
-export AEROX3_DEVICE="$SANDBOX/absent/aerox3-device"
-out="$("$AEROX3" set --presets 800 2>&1)"
-rc=$?
-check "a missing device helper exits non-zero" "1" "$rc"
-teardown
-
-# --- state file resilience -------------------------------------------------
-
-# A state file written by an older version has no preset table. Treating its
-# appliedAt as proof of a known table would push our *default* table onto the
-# device as though the user had chosen it.
-setup
-printf '{"dpi":800,"polling":1000,"appliedAt":"2026-08-19T21:43:37+03:00"}' >"$STATE_FILE"
-"$AEROX3" apply >/dev/null 2>&1
-check "a state file with no preset table never asserts a guessed table" \
-  "" "$(cat "$DEVICE_LOG" 2>/dev/null)"
-teardown
-
-setup
-printf '{"dpi":800,"polling":1000,"appliedAt":"2026-08-19T21:43:37+03:00"}' >"$STATE_FILE"
-check "a state file with no preset table reports itself as assumed" \
-  "true" "$("$AEROX3" get | jq -r .assumed)"
-teardown
-
-setup
-printf 'not json at all' >"$STATE_FILE"
-check "a corrupt state file falls back to defaults" \
-  "800,1600" "$("$AEROX3" get | jq -r '.presets | join(",")')"
-teardown
-
-setup
-printf '{"presets":[800,1200],"selected":9}' >"$STATE_FILE"
-check "a stored selection past the end of the table is clamped" \
-  "1" "$("$AEROX3" get | jq -r .selected)"
+"$STEELSERIES" set --presets 800,1200 >/dev/null 2>&1
+export STEELSERIES_DEVICE="$SANDBOX/bin/does-not-exist"
+check "a missing device helper is reported" \
+  "false" "$("$STEELSERIES" get | jq -r .helper)"
 teardown
 
 # --- output contract -------------------------------------------------------
 
 setup
-check "get emits valid JSON" "ok" "$("$AEROX3" get | jq -e . >/dev/null 2>&1 && echo ok)"
+check "get emits valid JSON" "ok" "$("$STEELSERIES" get | jq -e . >/dev/null 2>&1 && echo ok)"
+teardown
+
+setup
+check "get reports the device by name" \
+  "SteelSeries Aerox 3" "$("$STEELSERIES" get | jq -r .name)"
+teardown
+
+setup
+use_device "$CAPS_WIDE"
+check "an untested device says so" \
+  "false" "$("$STEELSERIES" get | jq -r .verified)"
 teardown
 
 setup
 check "set echoes the resulting state as JSON" \
-  "1200" "$("$AEROX3" set --presets 800,1200 --selected 1 2>/dev/null | jq -r .activeDpi)"
+  "1200" "$("$STEELSERIES" set --presets 800,1200 --selected 1 2>/dev/null | jq -r .activeDpi)"
 teardown
 
 setup
-out="$("$AEROX3" bogus-command 2>&1)"
+out="$("$STEELSERIES" bogus-command 2>&1)"
 rc=$?
 check "an unknown subcommand exits non-zero" "1" "$rc"
 check_contains "an unknown subcommand prints usage" "usage" "$out"

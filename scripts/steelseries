@@ -1,0 +1,579 @@
+#!/usr/bin/env bash
+#
+# Read and write SteelSeries mouse DPI presets and polling rate.
+#
+# Nothing about a particular mouse is hardcoded here. `steelseries-device
+# capabilities` reads rivalcfg's profile for whatever is plugged in and reports
+# the DPI range or the exact DPI values it accepts, how many presets it holds,
+# and which polling rates it understands; this script validates against that.
+#
+# Two device shapes come back. A `table` device holds 1-5 presets and a byte
+# saying which one is live, and cycles them with the button behind the wheel;
+# it reports that press back to the host — see `steelseries-device watch` — so
+# the selection shown here can be genuinely current rather than a guess. A
+# `pair` device predates that: two fixed DPI slots, each written separately,
+# with nothing on the wire naming the active one.
+#
+# What no device volunteers is its state on demand. Nothing arrives until a
+# button is pressed or we write, so the state file holds what we last wrote or
+# last saw, and `assumed` marks the gap before either has happened.
+#
+#   steelseries get                            print state as JSON
+#   steelseries set --presets 800,1200,1600 [--selected N]
+#   steelseries set --polling HZ
+#   steelseries select N                       switch active preset
+#   steelseries observe N [--presets ...]      record what the mouse reported
+#   steelseries apply                          re-assert stored state
+
+set -uo pipefail
+
+readonly STATE_VERSION=2
+readonly VENDOR_ID=1038
+
+STATE_FILE="${STEELSERIES_STATE_FILE:-${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/steelseries-mouse.json}"
+HIDRAW_DIR="${STEELSERIES_HIDRAW_DIR:-/sys/class/hidraw}"
+DEVICE_BIN="${STEELSERIES_DEVICE:-$(dirname "$(readlink -f "$0")")/steelseries-device}"
+
+# Capabilities of the connected device, filled in by load_capabilities. The
+# fallbacks only matter when nothing is plugged in, where they keep `get`
+# emitting a complete object instead of a half-empty one.
+cap_json='{}'
+cap_device=""
+cap_name=""
+cap_mode=""
+cap_dpi_min=200
+cap_dpi_max=8500
+cap_dpi_step=100
+cap_dpi_values=""
+cap_preset_min=1
+cap_preset_max=5
+cap_selectable=false
+cap_tracking=false
+cap_verified=false
+cap_polling="125 250 500 1000"
+cap_default_presets="800,1600"
+cap_default_polling=1000
+
+probe_key=""
+connected=false
+
+state_presets=""
+state_selected=0
+state_polling=""
+state_applied=""
+state_observed=""
+state_error=""
+
+usage() {
+  cat <<'EOF'
+usage: steelseries <command>
+
+  get                          print current state as JSON
+  set --presets N[,N...]       replace the DPI preset table
+      [--selected I]           which preset to activate (0-based)
+  set --polling HZ             set the polling rate
+  select I                     activate a stored preset (0-based)
+  observe I [--presets ...]    record what the mouse reported
+  apply                        re-assert the stored state
+
+  Limits come from the connected device: run `get` to see the DPI range,
+  how many presets it holds, and which polling rates it accepts.
+EOF
+}
+
+die() {
+  printf 'steelseries: %s\n' "$1" >&2
+  exit 1
+}
+
+have_device_helper() {
+  command -v "$DEVICE_BIN" >/dev/null 2>&1
+}
+
+# Which SteelSeries USB ids are plugged in, as one sorted string.
+#
+# This is the cheap question, answered by reading sysfs, and it is asked on
+# every single invocation. Deciding whether those ids are a *supported* mouse
+# costs a Python process and a rivalcfg import, so that answer is cached
+# against this key and recomputed only when the key changes.
+probe_devices() {
+  local uevent id ids=()
+  for uevent in "$HIDRAW_DIR"/*/device/uevent; do
+    [ -r "$uevent" ] || continue
+    id=$(sed -n "s/^HID_ID=[^:]*:0*\(${VENDOR_ID}\):0*\([0-9A-Fa-f]\+\)\$/\1:\2/p" "$uevent" | head -1)
+    [ -n "$id" ] && ids+=("${id,,}")
+  done
+  ((${#ids[@]})) || return 0
+  printf '%s\n' "${ids[@]}" | sort -u | paste -sd, -
+}
+
+# Ask the helper what the plugged device can do, or reuse the cached answer.
+load_capabilities() {
+  local key cached=""
+  key=$(probe_devices)
+  probe_key=$key
+
+  [ -n "$key" ] || return 0
+
+  if [ -r "$STATE_FILE" ]; then
+    cached=$(jq -c --arg key "$key" \
+      'select(.version == 2 and .probeKey == $key) | .capabilities // empty' \
+      "$STATE_FILE" 2>/dev/null)
+  fi
+
+  if [ -z "$cached" ]; then
+    have_device_helper || return 0
+    cached=$("$DEVICE_BIN" capabilities 2>/dev/null)
+    jq -e . >/dev/null 2>&1 <<<"$cached" || return 0
+  fi
+
+  cap_json=$cached
+  apply_capabilities
+}
+
+apply_capabilities() {
+  jq -e '.connected == true' >/dev/null 2>&1 <<<"$cap_json" || return 0
+
+  local device name mode dmin dmax dstep values pmin pmax selectable tracking
+  local verified polling defpresets defpolling
+  {
+    IFS= read -r -d '' device
+    IFS= read -r -d '' name
+    IFS= read -r -d '' mode
+    IFS= read -r -d '' dmin
+    IFS= read -r -d '' dmax
+    IFS= read -r -d '' dstep
+    IFS= read -r -d '' values
+    IFS= read -r -d '' pmin
+    IFS= read -r -d '' pmax
+    IFS= read -r -d '' selectable
+    IFS= read -r -d '' tracking
+    IFS= read -r -d '' verified
+    IFS= read -r -d '' polling
+    IFS= read -r -d '' defpresets
+    IFS= read -r -d '' defpolling
+  } < <(jq -j '[.device, .name, .mode, .dpiMin, .dpiMax, .dpiStep,
+                ((.dpiValues // []) | map(tostring) | join(" ")),
+                .presetMin, .presetMax, .selectable, .tracking, .verified,
+                ((.pollingOptions // []) | map(tostring) | join(" ")),
+                ((.defaultPresets // []) | map(tostring) | join(",")),
+                .defaultPolling]
+               | map(tostring) | join("\u0000") + "\u0000"' <<<"$cap_json")
+
+  connected=true
+  cap_device=$device
+  cap_name=$name
+  cap_mode=$mode
+  cap_dpi_min=$dmin
+  cap_dpi_max=$dmax
+  cap_dpi_step=$dstep
+  cap_dpi_values=$values
+  cap_preset_min=$pmin
+  cap_preset_max=$pmax
+  cap_selectable=$selectable
+  cap_tracking=$tracking
+  cap_verified=$verified
+  [ -n "$polling" ] && cap_polling=$polling
+  [ -n "$defpresets" ] && cap_default_presets=$defpresets
+  [[ "$defpolling" =~ ^[0-9]+$ ]] && cap_default_polling=$defpolling
+}
+
+read_state() {
+  state_presets=$cap_default_presets
+  state_polling=$cap_default_polling
+  state_selected=0
+  state_applied=""
+  state_observed=""
+  state_error=""
+
+  [ -r "$STATE_FILE" ] || return 0
+  [ -n "$cap_device" ] || return 0
+
+  # NUL-separated rather than tab: tab is IFS whitespace, so `read` would
+  # collapse two adjacent empty fields into one and shift everything after it.
+  local presets="" selected="" polling="" applied="" observed="" err=""
+  {
+    IFS= read -r -d '' presets
+    IFS= read -r -d '' selected
+    IFS= read -r -d '' polling
+    IFS= read -r -d '' applied
+    IFS= read -r -d '' observed
+    IFS= read -r -d '' err
+  } < <(jq -j --arg device "$cap_device" '
+          ((select(.version == 2) | .devices[$device]) // {})
+          | [((.presets // []) | map(tostring) | join(",")),
+             (.selected // ""), (.polling // ""),
+             (.appliedAt // ""), (.observedAt // ""), (.error // "")]
+          | map(tostring) | join("\u0000") + "\u0000"' "$STATE_FILE" 2>/dev/null)
+
+  [[ "$polling" =~ ^[0-9]+$ ]] && state_polling=$polling
+  state_error=$err
+
+  # Without a stored table we do not know what the device holds, whatever the
+  # timestamps say. A file from an older format lands here, and treating its
+  # appliedAt as knowledge would assert the *profile default* onto the mouse as
+  # though the user had chosen it.
+  [[ "$presets" =~ ^[0-9]+(,[0-9]+)*$ ]] || return 0
+
+  state_presets=$presets
+  [[ "$selected" =~ ^[0-9]+$ ]] && state_selected=$selected
+  state_applied=$applied
+  state_observed=$observed
+
+  # A table that shrank out from under a stored selection would otherwise
+  # index past its end.
+  local count
+  count=$(preset_count "$state_presets")
+  ((state_selected >= count)) && state_selected=$((count - 1))
+}
+
+preset_count() {
+  awk -F, '{print NF}' <<<"$1"
+}
+
+preset_at() {
+  cut -d, -f$(($2 + 1)) <<<"$1"
+}
+
+write_state() {
+  [ -n "$cap_device" ] || die "no supported SteelSeries mouse found"
+
+  local dir tmp existing='{}'
+  dir=$(dirname "$STATE_FILE")
+  mkdir -p "$dir" || die "cannot create state directory: $dir"
+
+  # Other devices' entries survive: unplugging one mouse and plugging another
+  # should not throw away what we knew about the first.
+  if [ -r "$STATE_FILE" ]; then
+    existing=$(jq -c 'select(.version == 2) | {devices: (.devices // {})}' "$STATE_FILE" 2>/dev/null)
+    [ -n "$existing" ] || existing='{}'
+  fi
+
+  tmp=$(mktemp "$STATE_FILE.XXXXXX") || die "cannot write state file"
+  jq -n \
+    --argjson existing "$existing" \
+    --argjson version "$STATE_VERSION" \
+    --arg probeKey "$probe_key" \
+    --argjson capabilities "$cap_json" \
+    --arg device "$cap_device" \
+    --argjson presets "[$state_presets]" \
+    --argjson selected "$state_selected" \
+    --argjson polling "$state_polling" \
+    --arg appliedAt "$state_applied" \
+    --arg observedAt "$state_observed" \
+    --arg error "$state_error" \
+    '{version: $version, probeKey: $probeKey, capabilities: $capabilities,
+      devices: (($existing.devices // {}) + {
+        ($device): {presets: $presets, selected: $selected, polling: $polling,
+                    appliedAt: $appliedAt, observedAt: $observedAt, error: $error}
+      })}' >"$tmp" &&
+    mv "$tmp" "$STATE_FILE" || {
+    rm -f "$tmp"
+    die "cannot write state file: $STATE_FILE"
+  }
+}
+
+emit_state() {
+  local helper=false assumed=true
+  have_device_helper && helper=true
+  { [ -n "$state_applied" ] || [ -n "$state_observed" ]; } && assumed=false
+
+  jq -n \
+    --argjson capabilities "$cap_json" \
+    --argjson presets "[$state_presets]" \
+    --argjson selected "$state_selected" \
+    --argjson activeDpi "$(preset_at "$state_presets" "$state_selected")" \
+    --argjson polling "$state_polling" \
+    --argjson assumed "$assumed" \
+    --argjson connected "$connected" \
+    --argjson helper "$helper" \
+    --arg appliedAt "$state_applied" \
+    --arg observedAt "$state_observed" \
+    --arg error "$state_error" \
+    '($capabilities | del(.connected)) + {
+      presets: $presets,
+      selected: $selected,
+      activeDpi: $activeDpi,
+      polling: $polling,
+      assumed: $assumed,
+      connected: $connected,
+      helper: $helper,
+      appliedAt: $appliedAt,
+      observedAt: $observedAt,
+      error: $error
+    }'
+}
+
+require_device() {
+  [ -n "$cap_device" ] || {
+    have_device_helper || die "device helper not found: $DEVICE_BIN"
+    die "no supported SteelSeries mouse found"
+  }
+}
+
+# Snap a DPI figure onto something the device will actually accept.
+normalize_dpi() {
+  local raw=$1 rounded value best="" best_gap=0 gap
+  [[ "$raw" =~ ^[0-9]+$ ]] || die "preset values must be whole numbers, got: $raw"
+
+  # A device with a fixed list of DPI values takes nothing in between, so the
+  # nearest listed value is the only sensible reading of a request.
+  if [ -n "$cap_dpi_values" ]; then
+    for value in $cap_dpi_values; do
+      gap=$((raw > value ? raw - value : value - raw))
+      if [ -z "$best" ] || ((gap < best_gap)); then
+        best=$value
+        best_gap=$gap
+      fi
+    done
+    printf '%s' "$best"
+    return 0
+  fi
+
+  ((cap_dpi_step > 0)) || die "the device reports no usable DPI step"
+  # Rounded relative to the low end of the range, because a range need not
+  # start on a multiple of its own step.
+  rounded=$((raw < cap_dpi_min ? cap_dpi_min : raw))
+  rounded=$((cap_dpi_min + (rounded - cap_dpi_min + cap_dpi_step / 2) / cap_dpi_step * cap_dpi_step))
+  ((rounded < cap_dpi_min)) && rounded=$cap_dpi_min
+  ((rounded > cap_dpi_max)) && rounded=$cap_dpi_max
+  printf '%s' "$rounded"
+}
+
+# Normalizes a comma-separated preset list, or dies explaining why it can't.
+normalize_presets() {
+  local raw=$1 cleaned out=() value
+  cleaned=${raw// /}
+  [ -n "$cleaned" ] || die "--presets needs at least one value"
+
+  # Check the shape before splitting. Field splitting drops a trailing empty
+  # field, so "800," would otherwise pass as a single-preset table and shrink
+  # the device's table without saying anything.
+  [[ "$cleaned" =~ ^[0-9]+(,[0-9]+)*$ ]] ||
+    die "--presets has an empty or non-numeric value: '$raw'"
+
+  IFS=',' read -ra out <<<"$cleaned"
+  ((${#out[@]} >= cap_preset_min)) ||
+    die "${cap_name:-the device} needs at least $cap_preset_min presets, got ${#out[@]}"
+  ((${#out[@]} <= cap_preset_max)) ||
+    die "${cap_name:-the device} holds at most $cap_preset_max presets, got ${#out[@]}"
+
+  local normalized=()
+  for value in "${out[@]}"; do
+    normalized+=("$(normalize_dpi "$value")") || exit 1
+  done
+
+  local IFS=','
+  printf '%s' "${normalized[*]}"
+}
+
+validate_selection() {
+  local index=$1 csv=$2 count
+  [[ "$index" =~ ^[0-9]+$ ]] || die "preset index must be a whole number, got: $index"
+  count=$(preset_count "$csv")
+  ((index < count)) || die "preset $index does not exist (the table holds $count)"
+  printf '%s' "$index"
+}
+
+validate_polling() {
+  local raw=$1 rate
+  for rate in $cap_polling; do
+    if [ "$raw" = "$rate" ]; then
+      printf '%s' "$raw"
+      return 0
+    fi
+  done
+  die "--polling must be one of $cap_polling (Hz), got: $raw"
+}
+
+# Hand a command to the device helper, recording success or failure in the
+# state file. A failed write leaves the previously known-good values alone.
+device() {
+  local stderr_file output rc
+
+  have_device_helper || die "device helper not found: $DEVICE_BIN"
+
+  stderr_file=$(mktemp)
+  "$DEVICE_BIN" "$@" >/dev/null 2>"$stderr_file"
+  rc=$?
+  output=$(tr -d '\r' <"$stderr_file" | grep -v '^[[:space:]]*$' | tail -1)
+  rm -f "$stderr_file"
+
+  if [ "$rc" -ne 0 ]; then
+    state_error=${output:-"device helper exited with status $rc"}
+    write_state
+    die "$state_error"
+  fi
+}
+
+# Push the preset table, however this device spells that.
+write_presets() {
+  local presets=$1 selected=$2 persist=$3
+
+  if [ "$cap_mode" = "pair" ]; then
+    device pair "$(preset_at "$presets" 0)" "$(preset_at "$presets" 1)"
+  else
+    device presets "$presets" "$selected" "$persist"
+  fi
+}
+
+cmd_get() {
+  read_state
+  emit_state
+}
+
+cmd_set() {
+  local presets="" selected="" polling=""
+
+  load_capabilities
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --presets)
+        [ $# -ge 2 ] || die "--presets requires a value"
+        require_device
+        presets=$(normalize_presets "$2") || exit 1
+        shift 2
+        ;;
+      --selected)
+        [ $# -ge 2 ] || die "--selected requires a value"
+        selected=$2
+        shift 2
+        ;;
+      --polling)
+        [ $# -ge 2 ] || die "--polling requires a value"
+        require_device
+        polling=$(validate_polling "$2") || exit 1
+        shift 2
+        ;;
+      *)
+        usage >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  [ -n "$presets" ] || [ -n "$polling" ] || {
+    usage >&2
+    exit 1
+  }
+
+  require_device
+  read_state
+
+  if [ -n "$presets" ]; then
+    # A new table is written with its first preset active unless told
+    # otherwise; carrying the old index over could point anywhere.
+    selected=$(validate_selection "${selected:-0}" "$presets") || exit 1
+    write_presets "$presets" "$selected" --save
+    state_presets=$presets
+    state_selected=$selected
+  elif [ -n "$selected" ]; then
+    die "--selected only makes sense together with --presets"
+  fi
+
+  if [ -n "$polling" ]; then
+    device polling "$polling"
+    state_polling=$polling
+  fi
+
+  state_error=""
+  state_applied=$(date -Iseconds)
+  write_state
+  emit_state
+}
+
+cmd_select() {
+  local index=${1:-}
+  [ -n "$index" ] || die "select needs a preset index"
+
+  load_capabilities
+  require_device
+  [ "$cap_selectable" = true ] ||
+    die "${cap_name:-the device} has fixed DPI slots and cannot be switched from here"
+
+  read_state
+  index=$(validate_selection "$index" "$state_presets") || exit 1
+
+  # There is no select-only command: the selection rides along with the table,
+  # so switching means rewriting it. Skip the flash write — the selection is
+  # re-asserted at startup anyway, and clicking presets would otherwise wear
+  # the device's memory.
+  write_presets "$state_presets" "$index" --no-save
+
+  state_selected=$index
+  state_error=""
+  state_applied=$(date -Iseconds)
+  write_state
+  emit_state
+}
+
+# Record what the mouse told us, without writing anything back to it.
+cmd_observe() {
+  local index=${1:-} presets=""
+  [ -n "$index" ] || die "observe needs a preset index"
+  shift
+
+  load_capabilities
+  require_device
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --presets)
+        [ $# -ge 2 ] || die "--presets requires a value"
+        presets=$(normalize_presets "$2") || exit 1
+        shift 2
+        ;;
+      *)
+        usage >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  read_state
+  # The device is authoritative about its own table, so a report that
+  # disagrees with ours replaces it rather than being reconciled.
+  [ -n "$presets" ] && state_presets=$presets
+
+  index=$(validate_selection "$index" "$state_presets") || exit 1
+  state_selected=$index
+  state_observed=$(date -Iseconds)
+  state_error=""
+  write_state
+  emit_state
+}
+
+cmd_apply() {
+  load_capabilities
+  [ -n "$cap_device" ] || return 0
+  read_state
+  [ -n "$state_applied" ] || return 0
+
+  write_presets "$state_presets" "$state_selected" --no-save
+  device polling "$state_polling"
+  emit_state
+}
+
+main() {
+  local command=${1:-}
+  [ $# -gt 0 ] && shift
+
+  case "$command" in
+    get)
+      load_capabilities
+      cmd_get "$@"
+      ;;
+    set) cmd_set "$@" ;;
+    select) cmd_select "$@" ;;
+    observe) cmd_observe "$@" ;;
+    apply) cmd_apply "$@" ;;
+    -h | --help) usage ;;
+    *)
+      usage >&2
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

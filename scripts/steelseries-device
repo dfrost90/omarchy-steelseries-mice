@@ -1,0 +1,465 @@
+#!/usr/bin/env python3
+"""Hardware access for the SteelSeries mouse plugin.
+
+Everything device-specific is read out of rivalcfg's own per-device profile
+rather than hardcoded here: the USB ids, the DPI range or the list of DPI
+values the device accepts, how many presets it holds, and which polling rates
+it understands. `capabilities` hands that to the panel so one UI can describe
+76 different product ids.
+
+Writes go through rivalcfg's library rather than its CLI, because the CLI
+cannot express which preset is active: `--sensitivity` always activates the
+first entry, while the underlying command carries a selected-preset byte.
+
+Reads are a different mechanism entirely. Modern SteelSeries mice push an
+unsolicited report whenever the DPI button is pressed, carrying both the active
+index and the whole preset table, so `watch` can follow the physical button.
+Nothing arrives on request — only on a press.
+
+    steelseries-device capabilities
+    steelseries-device presets 800,1200,1600 1 [--save|--no-save]
+    steelseries-device pair 800 1600
+    steelseries-device polling 1000
+    steelseries-device probe
+    steelseries-device watch
+"""
+
+import json
+import os
+import select
+import sys
+
+HIDRAW_DIR = os.environ.get("STEELSERIES_HIDRAW_DIR", "/sys/class/hidraw")
+
+# Devices whose behaviour has been checked against real hardware. Everything
+# else is driven from rivalcfg's profile alone, which is enough to write
+# settings but not enough to promise the panel tracks the physical button.
+#
+# first_preset overrides rivalcfg's value for the selected-preset byte. The
+# Aerox 3 profile declares 1; the device counts from 0, verified by writing raw
+# payloads — see the README.
+VERIFIED = {
+    "1038:1836": {"first_preset": 0},
+}
+
+# Only these sensitivity handlers carry a preset table with a selection byte.
+TABLE_HANDLERS = ("multidpi_range_choice", "multidpi_range_choice_xy", "multidpi_range")
+
+# A notification can only be trusted when every DPI byte can be checked against
+# a known code table. The other table handlers encode DPI as a plain number,
+# where any byte looks valid and a stray report would be read as a DPI change.
+TRACKABLE_HANDLERS = ("multidpi_range_choice",)
+
+
+def is_trackable(setting):
+    """Whether button presses on this device can be decoded.
+
+    The report layout was worked out on an Aerox 3: one command byte echoed
+    with the high bit set, then count, selection, and one byte per preset. Two
+    of rivalcfg's profiles do not fit that shape — a two-byte command, whose
+    second byte may or may not be echoed, and a two-byte DPI code — and
+    guessing at either would mean reading garbage as a DPI change. They stay
+    writable; only the live tracking is switched off.
+    """
+    return (
+        setting["value_type"] in TRACKABLE_HANDLERS
+        and len(setting["command"]) == 1
+        and setting.get("dpi_length_byte") == 1
+    )
+
+
+def device_id(vendor, product):
+    return "%04x:%04x" % (vendor, product)
+
+
+def profiles():
+    """Every rivalcfg profile, keyed the way this plugin names devices."""
+    from rivalcfg.devices import PROFILES
+
+    return {device_id(v, p): profile for (v, p), profile in PROFILES.items()}
+
+
+def sensitivity_setting(profile):
+    """The preset-table setting, or None on devices that have fixed slots."""
+    setting = profile["settings"].get("sensitivity")
+    if setting and setting.get("value_type") in TABLE_HANDLERS:
+        return setting
+    return None
+
+
+def dpi_constraint(setting):
+    """What DPI values a setting accepts, as the panel needs to hear it.
+
+    `range` and `range_choice` settings take anything on a step within a range;
+    `choice` settings take one of a fixed handful of values and nothing else.
+    """
+    span = setting.get("input_range")
+    if span:
+        return {"dpiMin": span[0], "dpiMax": span[1], "dpiStep": span[2], "dpiValues": []}
+
+    choices = setting.get("choices")
+    if choices:
+        values = sorted(int(v) for v in choices)
+        return {
+            "dpiMin": values[0],
+            "dpiMax": values[-1],
+            "dpiStep": 0,
+            "dpiValues": values,
+        }
+
+    return None
+
+
+def default_presets(setting):
+    """The table rivalcfg says the device ships with, as a list of ints.
+
+    Only ever shown as an assumption — it is what the factory put there, not
+    what this particular mouse currently holds.
+
+    Devices with independent X and Y sensitivity spell their defaults "800:800".
+    The panel edits one figure per preset, so the X value stands for both.
+    """
+    raw = setting.get("default")
+    if raw is None:
+        return []
+    if isinstance(raw, (int, float)):
+        return [int(raw)]
+    return [
+        int(dpi.split(":")[0])
+        for dpi in str(raw).replace(" ", "").split(",")
+        if dpi
+    ]
+
+
+def capabilities(profile, ident):
+    """Describe one device as a flat JSON-friendly dict.
+
+    Two shapes come out of this. `table` devices hold a variable table of up to
+    five presets plus a byte saying which one is live — the Aerox 3 and its
+    relatives. `pair` devices predate that: they hold exactly two fixed DPI
+    slots, each written by its own command, and nothing on the wire says which
+    of the two the button has selected.
+    """
+    settings = profile["settings"]
+    rate = settings.get("polling_rate", {})
+    polling = sorted(int(hz) for hz in rate.get("choices", {}))
+    default_polling = int(rate.get("default", polling[-1] if polling else 1000))
+    verified = ident in VERIFIED
+
+    setting = sensitivity_setting(profile)
+    if setting:
+        limits = dpi_constraint(setting)
+        if limits is None:
+            return None
+        return dict(
+            limits,
+            connected=True,
+            device=ident,
+            name=profile["name"],
+            mode="table",
+            presetMin=1,
+            presetMax=setting.get("max_preset_count", 1),
+            selectable=True,
+            tracking=is_trackable(setting),
+            verified=verified,
+            pollingOptions=polling,
+            defaultPolling=default_polling,
+            defaultPresets=default_presets(setting),
+        )
+
+    if "sensitivity1" in settings and "sensitivity2" in settings:
+        limits = dpi_constraint(settings["sensitivity1"])
+        if limits is None:
+            return None
+        return dict(
+            limits,
+            connected=True,
+            device=ident,
+            name=profile["name"],
+            mode="pair",
+            presetMin=2,
+            presetMax=2,
+            # The button toggles the two slots, but the device neither accepts
+            # a selection nor announces one, so the panel cannot mark either.
+            selectable=False,
+            tracking=False,
+            verified=verified,
+            pollingOptions=polling,
+            defaultPolling=default_polling,
+            defaultPresets=default_presets(settings["sensitivity1"])
+            + default_presets(settings["sensitivity2"]),
+        )
+
+    return None
+
+
+def first_preset(setting, ident):
+    """The number the device gives its first preset.
+
+    rivalcfg records this per device and is wrong for at least one of them, so
+    a hardware-verified override wins where we have one.
+    """
+    override = VERIFIED.get(ident, {}).get("first_preset")
+    if override is not None:
+        return override
+    return setting.get("first_preset", 0)
+
+
+def dpi_table(setting):
+    """DPI code -> DPI value, inverted from rivalcfg's own device profile.
+
+    Reusing the profile means the decode can never drift from the encode.
+    """
+    return {code: dpi for dpi, code in setting["output_choices"].items()}
+
+
+def decode_report(data, setting, ident):
+    """Decode a DPI notification, or return None if this is not one.
+
+    Layout: the sensitivity command id with the high bit set, the preset count,
+    the selected index, then one encoded DPI byte per preset. Every field is
+    checked against the profile, because this is the only place an unrelated
+    report from a shared interface could be mistaken for a DPI change.
+    """
+    report_id = setting["command"][0] | 0x80
+    if len(data) < 3 or data[0] != report_id:
+        return None
+
+    count = data[1]
+    selected = data[2]
+    base = first_preset(setting, ident)
+    if count < 1 or count > setting.get("max_preset_count", 5):
+        return None
+    # The device numbers its presets from `base`, so a 1-based device reports
+    # `count` for its last preset — a bound an index check written for 0 would
+    # reject.
+    if not base <= selected < count + base or len(data) < 3 + count:
+        return None
+
+    table = dpi_table(setting)
+    presets = []
+    for code in data[3 : 3 + count]:
+        if code not in table:
+            return None
+        presets.append(table[code])
+
+    return {"selected": selected - base, "presets": presets}
+
+
+def hidraw_nodes(ident):
+    """Every hidraw node belonging to one device.
+
+    Which of its interfaces carries the notifications is not fixed, and the
+    numbering shifts between replugs, so callers listen to all of them.
+    """
+    vendor, product = (int(part, 16) for part in ident.split(":"))
+    wanted = "%04x:%08x:%08x" % (3, vendor, product)
+    nodes = []
+    try:
+        entries = sorted(os.listdir(HIDRAW_DIR))
+    except OSError:
+        return nodes
+
+    for name in entries:
+        uevent = os.path.join(HIDRAW_DIR, name, "device", "uevent")
+        try:
+            with open(uevent) as handle:
+                content = handle.read()
+        except OSError:
+            continue
+        for line in content.splitlines():
+            if line.startswith("HID_ID=") and line[7:].lower() == wanted:
+                nodes.append("/dev/%s" % name)
+                break
+    return nodes
+
+
+def find_device():
+    """The plugged, supported device, as (id, profile). Raises if there is none.
+
+    rivalcfg answers this by probing the USB tree for every profile it knows,
+    which is the same question `probe` asks and costs the same either way.
+    """
+    from rivalcfg import devices
+
+    known = profiles()
+    for plugged in devices.list_plugged_devices():
+        ident = device_id(plugged["vendor_id"], plugged["product_id"])
+        if ident in known:
+            return ident, known[ident]
+    raise SystemExit("no supported SteelSeries mouse found")
+
+
+def sensitivity_payload(setting, ident, presets, selected):
+    """Build the sensitivity command, selecting `selected` (0-based).
+
+    rivalcfg encodes the DPI codes correctly, but adds `first_preset` to the
+    selection. Where that constant is wrong the selection lands one preset too
+    high, and asking for the last preset produces a byte one past the end that
+    the device silently ignores — the DPI simply never changes.
+
+    Only the selection byte is touched here, and only for a device whose real
+    numbering has been checked; the DPI codes always come from rivalcfg.
+    """
+    from rivalcfg import handlers
+
+    handler = getattr(handlers, setting["value_type"])
+    csv = ",".join(str(p) for p in presets)
+    base = first_preset(setting, ident)
+
+    if base == setting.get("first_preset", 0):
+        data = list(handler.process_value(setting, csv, selected))
+    else:
+        # 0 is always a valid selection, so this passes rivalcfg's own range
+        # check; the byte it produces is then overwritten with the device's
+        # numbering.
+        data = list(handler.process_value(setting, csv, 0))
+        data[1] = selected + base
+
+    return list(setting["command"]) + data
+
+
+def open_mouse(ident):
+    from rivalcfg import mouse as mouse_module
+
+    vendor, product = (int(part, 16) for part in ident.split(":"))
+    handle = mouse_module.get_mouse(vendor_id=vendor, product_id=product)
+    if handle is None:
+        raise SystemExit("no supported SteelSeries mouse found")
+    return handle
+
+
+def cmd_capabilities(argv):
+    try:
+        ident, profile = find_device()
+    except SystemExit:
+        print(json.dumps({"connected": False}))
+        return
+
+    caps = capabilities(profile, ident)
+    if caps is None:
+        print(json.dumps({
+            "connected": False,
+            "device": ident,
+            "name": profile["name"],
+            "error": "%s exposes no DPI setting rivalcfg can drive" % profile["name"],
+        }))
+        return
+    print(json.dumps(caps))
+
+
+def cmd_presets(argv):
+    if len(argv) < 2:
+        raise SystemExit("usage: steelseries-device presets <csv> <selected> [--save]")
+
+    presets = [int(p) for p in argv[0].split(",")]
+    selected = int(argv[1])
+    # Selection changes happen every time a preset is clicked; persisting each
+    # one to the device's flash would wear it for no benefit, since startup
+    # re-asserts the state anyway.
+    save = "--save" in argv[2:]
+
+    ident, profile = find_device()
+    setting = sensitivity_setting(profile)
+    if setting is None:
+        raise SystemExit("%s has fixed DPI slots; use 'pair'" % profile["name"])
+
+    handle = open_mouse(ident)
+    # Written directly rather than through set_sensitivity, so the corrected
+    # selection byte in sensitivity_payload survives.
+    handle._hid_write(
+        report_type=setting["report_type"],
+        data=sensitivity_payload(setting, ident, presets, selected),
+        packet_length=setting.get("packet_length", 0),
+    )
+    if save:
+        handle.save()
+
+
+def cmd_pair(argv):
+    """Write the two fixed DPI slots of a pre-table device."""
+    if len(argv) < 2:
+        raise SystemExit("usage: steelseries-device pair <dpi1> <dpi2>")
+
+    ident, profile = find_device()
+    if sensitivity_setting(profile) is not None:
+        raise SystemExit("%s holds a preset table; use 'presets'" % profile["name"])
+
+    handle = open_mouse(ident)
+    handle.set_sensitivity1(int(argv[0]))
+    handle.set_sensitivity2(int(argv[1]))
+    handle.save()
+
+
+def cmd_polling(argv):
+    if not argv:
+        raise SystemExit("usage: steelseries-device polling <hz>")
+
+    ident, _ = find_device()
+    handle = open_mouse(ident)
+    handle.set_polling_rate(int(argv[0]))
+    handle.save()
+
+
+def cmd_probe(argv):
+    ident, _ = find_device()
+    print(ident)
+
+
+def cmd_watch(argv):
+    ident, profile = find_device()
+    setting = sensitivity_setting(profile)
+    if setting is None or not is_trackable(setting):
+        # Nothing to listen for. Exiting quietly keeps the panel from treating
+        # an unsupported device as a broken one.
+        return
+
+    nodes = hidraw_nodes(ident)
+    if not nodes:
+        raise SystemExit("no supported SteelSeries mouse found")
+
+    handles = {}
+    for path in nodes:
+        try:
+            handles[os.open(path, os.O_RDONLY | os.O_NONBLOCK)] = path
+        except OSError:
+            continue
+    if not handles:
+        raise SystemExit("cannot read the mouse (check the rivalcfg udev rules)")
+
+    last = None
+    try:
+        while True:
+            ready, _, _ = select.select(list(handles), [], [])
+            for handle in ready:
+                try:
+                    data = os.read(handle, 64)
+                except OSError:
+                    continue
+                decoded = decode_report(data, setting, ident)
+                if decoded is None or decoded == last:
+                    continue
+                last = decoded
+                print(json.dumps(decoded), flush=True)
+    except KeyboardInterrupt:
+        pass
+
+
+COMMANDS = {
+    "capabilities": cmd_capabilities,
+    "presets": cmd_presets,
+    "pair": cmd_pair,
+    "polling": cmd_polling,
+    "probe": cmd_probe,
+    "watch": cmd_watch,
+}
+
+
+def main(argv):
+    if not argv or argv[0] not in COMMANDS:
+        raise SystemExit(__doc__.strip())
+    COMMANDS[argv[0]](argv[1:])
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

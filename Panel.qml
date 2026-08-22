@@ -4,24 +4,29 @@ import Quickshell.Io
 import qs.Ui
 import qs.Commons
 
-// Bar widget for the SteelSeries Aerox 3: shows the active DPI and opens a
-// panel for editing the preset table and polling rate.
+// Bar widget for SteelSeries mice: shows the active DPI and opens a panel for
+// editing the preset table and polling rate.
 //
-// The mouse holds up to five DPI presets and cycles them with the button
-// behind the scroll wheel. It reports that press back to the host, so
-// `aerox3-device watch` keeps this panel honest when you use the button
-// instead of the panel — the selection shown here is what the device actually
-// told us, not a guess. The device volunteers nothing on request though, so
-// before the first write or press the state is flagged `assumed`.
+// Nothing here knows which mouse is plugged in. `scripts/steelseries get`
+// returns the device's capabilities alongside its state — the DPI range or the
+// exact DPI values it accepts, how many presets it holds, whether the active
+// one can be chosen at all — and this panel draws itself from that.
+//
+// Modern mice hold a table of presets and cycle them with the button behind
+// the scroll wheel, reporting the press back to the host, so
+// `steelseries-device watch` keeps this panel honest when you use the button
+// instead of the panel. Older ones hold two fixed slots and say nothing. The
+// device volunteers nothing on request either way, so before the first write
+// or press the state is flagged `assumed`.
 Panel {
   id: root
-  moduleName: "dfrost.aerox3"
-  ipcTarget: "dfrost.aerox3"
+  moduleName: "omarchyplugins.steelseries"
+  ipcTarget: "omarchyplugins.steelseries"
 
   readonly property string script: Quickshell.env("HOME")
-    + "/.config/omarchy/plugins/" + moduleName + "/scripts/aerox3"
+    + "/.config/omarchy/plugins/" + moduleName + "/scripts/steelseries"
   readonly property string deviceScript: Quickshell.env("HOME")
-    + "/.config/omarchy/plugins/" + moduleName + "/scripts/aerox3-device"
+    + "/.config/omarchy/plugins/" + moduleName + "/scripts/steelseries-device"
 
   property var presets: [800, 1600]
   property int selected: 0
@@ -34,16 +39,32 @@ Panel {
   property string appliedAt: ""
   property bool busy: false
 
+  // Everything below is the connected device describing itself.
+  property string deviceName: "SteelSeries mouse"
+  property string mode: "table"
+  property int dpiMin: 200
+  property int dpiMax: 8500
+  property int dpiStep: 100
+  property var dpiValues: []
+  property int presetMin: 1
+  property int presetMax: 5
+  property bool selectable: true
+  property bool tracking: false
+  property bool verified: false
+  property var pollingOptions: ["125", "250", "500", "1000"]
+
   // Nothing may write to the mouse until we have read the state once.
   // Bindings settle as the panel builds — a ButtonGroup emits `changed` on
   // its way to the stored value — and an unguarded write turns that into a
   // hardware change the user never asked for.
   property bool ready: false
 
-  readonly property int maxPresets: 5
-  readonly property var pollingOptions: ["125", "250", "500", "1000"]
   readonly property bool healthy: connected && haveHelper && lastError === ""
   readonly property bool editable: ready && healthy
+  // A device with a fixed handful of DPI values takes nothing in between, so
+  // those rows offer the values themselves rather than a stepper.
+  readonly property bool discreteDpi: dpiValues.length > 0
+  readonly property bool resizable: presetMax > presetMin
 
   readonly property color fg: bar ? bar.barForeground : Color.foreground
   readonly property color panelFg: bar ? bar.foreground : Color.foreground
@@ -67,7 +88,7 @@ Panel {
   }
 
   function selectPreset(index) {
-    if (!editable || index === root.selected) return
+    if (!editable || !selectable || index === root.selected) return
     root.selected = index
     root.activeDpi = root.presets[index]
     run(["select", String(index)])
@@ -82,14 +103,14 @@ Panel {
   }
 
   function addPreset() {
-    if (!editable || root.presets.length >= root.maxPresets) return
+    if (!editable || root.presets.length >= root.presetMax) return
     var next = root.presets.slice()
     next.push(next[next.length - 1])
     writePresets(next, root.selected)
   }
 
   function removePreset(index) {
-    if (!editable || root.presets.length <= 1) return
+    if (!editable || root.presets.length <= root.presetMin) return
     var next = root.presets.slice()
     next.splice(index, 1)
     // The table shrank under the selection; keep it inside the new bounds.
@@ -125,6 +146,21 @@ Panel {
     root.haveHelper = state.helper === true
     root.lastError = String(state.error || "")
     root.appliedAt = String(state.appliedAt || "")
+
+    if (state.name) root.deviceName = String(state.name)
+    if (state.mode) root.mode = String(state.mode)
+    if (state.dpiMin > 0) root.dpiMin = state.dpiMin
+    if (state.dpiMax > 0) root.dpiMax = state.dpiMax
+    root.dpiStep = state.dpiStep > 0 ? state.dpiStep : 1
+    root.dpiValues = state.dpiValues instanceof Array ? state.dpiValues : []
+    if (state.presetMin > 0) root.presetMin = state.presetMin
+    if (state.presetMax > 0) root.presetMax = state.presetMax
+    root.selectable = state.selectable === true
+    root.tracking = state.tracking === true
+    root.verified = state.verified === true
+    if (state.pollingOptions instanceof Array && state.pollingOptions.length > 0)
+      root.pollingOptions = state.pollingOptions.map(String)
+
     root.ready = true
   }
 
@@ -144,10 +180,24 @@ Panel {
 
   function statusLine() {
     if (!haveHelper) return "Device helper missing"
-    if (!connected) return "Mouse not connected"
+    if (!connected) return "No supported SteelSeries mouse connected"
     if (lastError !== "") return lastError
     if (assumed) return "Assumed — nothing applied or observed yet"
+    if (!selectable) return presets.length + " fixed DPI slots · switched on the mouse"
     return "Preset " + (selected + 1) + " of " + presets.length + " · " + activeDpi + " DPI"
+  }
+
+  // Said plainly rather than hidden, because it is the one thing about this
+  // panel that a user cannot check for themselves: on any mouse but the one it
+  // was developed against, the writes are built from rivalcfg's profile and
+  // have never been watched landing on real hardware.
+  function caveatLine() {
+    if (!connected || verified) return ""
+    if (mode === "pair")
+      return "Untested model. Fixed slots — the panel cannot follow the DPI button."
+    if (!tracking)
+      return "Untested model. Its report layout is unknown, so the DPI button is not followed."
+    return "Untested model, driven from rivalcfg's profile."
   }
 
   visible: connected
@@ -174,7 +224,7 @@ Panel {
       waitForEnd: true
       onStreamFinished: {
         var message = String(text || "").trim()
-        if (message !== "") root.lastError = message.replace(/^aerox3: /, "")
+        if (message !== "") root.lastError = message.replace(/^steelseries: /, "")
       }
     }
     onExited: {
@@ -186,11 +236,12 @@ Panel {
   }
 
   // Follows the physical DPI button for as long as the shell runs. The read
-  // blocks in the helper, so this costs nothing while the button is idle.
+  // blocks in the helper, so this costs nothing while the button is idle, and
+  // devices whose report layout we cannot decode never start it at all.
   Process {
     id: watchProc
     command: [root.deviceScript, "watch"]
-    running: root.connected
+    running: root.connected && root.tracking
     stdout: SplitParser {
       onRead: function(line) { root.observed(line) }
     }
@@ -209,10 +260,10 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: "󰍽 " + root.activeDpi
+    text: "󰍽 " + (root.selectable ? root.activeDpi : root.presets.join("/"))
     active: root.opened
     dimmed: root.assumed
-    tooltipText: root.activeDpi + " DPI · " + root.polling + " Hz"
+    tooltipText: root.deviceName + " · " + root.polling + " Hz"
     onPressed: function(b) { root.toggle() }
   }
 
@@ -250,7 +301,7 @@ Panel {
 
           Text {
             id: title
-            text: "Aerox 3"
+            text: root.deviceName
             color: root.panelFg
             font.family: root.fontFamily
             font.pixelSize: Style.font.subtitle
@@ -275,10 +326,20 @@ Panel {
           wrapMode: Text.Wrap
         }
 
+        Text {
+          width: parent.width
+          visible: text !== ""
+          text: root.caveatLine()
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.Wrap
+        }
+
         PanelSeparator { width: parent.width; foreground: root.panelFg }
 
         PanelSectionHeader {
-          text: "DPI PRESETS"
+          text: root.selectable ? "DPI PRESETS" : "DPI SLOTS"
           foreground: root.panelFg
           fontFamily: root.fontFamily
         }
@@ -294,30 +355,36 @@ Panel {
             spacing: Style.spacing.controlGap
 
             // Click the marker to make this preset the active one — the same
-            // thing the button behind the scroll wheel does.
+            // thing the button behind the scroll wheel does. Devices that
+            // cannot be told which slot is live get a plain number instead of
+            // a control that would do nothing.
             Text {
               anchors.verticalCenter: parent.verticalCenter
               width: Style.space(18)
-              text: presetRow.index === root.selected ? "●" : "○"
-              color: presetRow.index === root.selected ? root.panelFg : root.dim
+              text: root.selectable
+                ? (presetRow.index === root.selected ? "●" : "○")
+                : String(presetRow.index + 1)
+              color: root.selectable && presetRow.index === root.selected
+                ? root.panelFg : root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
 
               MouseArea {
                 anchors.fill: parent
                 cursorShape: Qt.PointingHandCursor
-                enabled: root.editable
+                enabled: root.editable && root.selectable
                 onClicked: root.selectPreset(presetRow.index)
               }
             }
 
             NumberField {
               anchors.verticalCenter: parent.verticalCenter
+              visible: !root.discreteDpi
               value: presetRow.index < root.presets.length
-                ? root.presets[presetRow.index] : 200
-              from: 200
-              to: 8500
-              stepSize: 100
+                ? root.presets[presetRow.index] : root.dpiMin
+              from: root.dpiMin
+              to: root.dpiMax
+              stepSize: root.dpiStep
               foreground: root.panelFg
               accent: Color.accent
               fontFamily: root.fontFamily
@@ -328,9 +395,27 @@ Panel {
               onModified: function(value) { root.setPresetValue(presetRow.index, value) }
             }
 
+            ButtonGroup {
+              anchors.verticalCenter: parent.verticalCenter
+              visible: root.discreteDpi
+              options: root.dpiValues.map(String)
+              value: presetRow.index < root.presets.length
+                ? String(root.presets[presetRow.index]) : ""
+              foreground: root.panelFg
+              background: root.bar ? root.bar.background : Color.background
+              accent: Color.accent
+              fontFamily: root.fontFamily
+              fontSize: Style.font.bodySmall
+              focusable: false
+
+              onChanged: function(value) {
+                root.setPresetValue(presetRow.index, parseInt(value, 10))
+              }
+            }
+
             Button {
               anchors.verticalCenter: parent.verticalCenter
-              visible: root.presets.length > 1
+              visible: root.presets.length > root.presetMin
               iconText: "×"
               tooltipText: "Remove this preset"
               foreground: root.panelFg
@@ -342,7 +427,7 @@ Panel {
         }
 
         Button {
-          visible: root.presets.length < root.maxPresets
+          visible: root.resizable && root.presets.length < root.presetMax
           text: "+ add preset"
           foreground: root.panelFg
           accent: Color.accent

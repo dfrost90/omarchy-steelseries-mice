@@ -1,12 +1,12 @@
 {
   "schemaVersion": 1,
-  "id": "dfrost.aerox3",
-  "name": "Aerox 3",
-  "version": "1.0.0",
+  "id": "omarchyplugins.steelseries",
+  "name": "SteelSeries Mouse",
+  "version": "2.0.0",
   "author": "dfrost",
   "license": "MIT",
   "homepage": "https://github.com/dfrost90/omarchy-aerox3",
-  "description": "DPI and polling rate for the SteelSeries Aerox 3, driven by rivalcfg",
+  "description": "DPI presets and polling rate for SteelSeries mice, driven by rivalcfg",
   "kinds": [
     "bar-widget"
   ],
@@ -14,8 +14,8 @@
     "barWidget": "Panel.qml"
   },
   "barWidget": {
-    "displayName": "Aerox 3",
-    "description": "Mouse DPI and polling rate. Click to adjust.",
+    "displayName": "Mouse DPI",
+    "description": "SteelSeries mouse DPI and polling rate. Click to adjust.",
     "category": "Hardware",
     "defaultSection": "right",
     "allowMultiple": false

@@ -1,21 +1,27 @@
-# Aerox 3
+# SteelSeries Mouse
 
-Omarchy shell plugin for the SteelSeries Aerox 3: edit the DPI preset table
-and polling rate from the bar, and follow the physical DPI button live.
+Omarchy shell plugin for SteelSeries mice: edit the DPI preset table and
+polling rate from the bar, and follow the physical DPI button live.
 
 ![panel](docs/panel.png)
 
 ## What it does
 
-The mouse holds up to five DPI presets and cycles between them when you press
-the button behind the scroll wheel. The panel shows that table, marks the
-active preset, and lets you edit any value, add or remove presets (1–5), and
+Modern SteelSeries mice hold up to five DPI presets and cycle between them when
+you press the button behind the scroll wheel. The panel shows that table, marks
+the active preset, and lets you edit any value, add or remove presets, and
 change the polling rate.
 
 Press the physical button and the panel follows — the mouse pushes an
 unsolicited HID report on every press carrying both the active index and the
 whole preset table, so what you see is what the device reported, not a cached
 guess.
+
+Nothing about a particular mouse is written into this plugin. The DPI range,
+how many presets the device holds, which polling rates it accepts, whether the
+active preset can be chosen at all — all of it comes out of
+[`rivalcfg`](https://github.com/flozz/rivalcfg)'s per-device profile at runtime,
+and the panel draws itself from that.
 
 ## Requirements
 
@@ -29,38 +35,77 @@ guess.
 ## Install
 
 ```bash
-omarchy plugin enable dfrost.aerox3 right
+omarchy plugin add https://github.com/dfrost90/omarchy-aerox3.git --enable
 ```
 
 Bind a key to open the panel:
 
 ```
-omarchy-shell dfrost.aerox3 toggle
+omarchy-shell omarchyplugins.steelseries toggle
 ```
+
+## Device support
+
+Every mouse rivalcfg knows — 76 USB ids — falls into one of three tiers.
+
+**Tested on hardware.** The wired Aerox 3 (`1038:1836`), and only that. It is
+the mouse this was developed against, and the one place the wire protocol has
+actually been watched rather than inferred.
+
+**Preset table, tracked (22 ids).** Aerox 3 / 3 Wireless, Aerox 5 / 5 Wireless,
+Aerox 9 Wireless, Prime Wireless, Prime Mini Wireless, Rival 5, and their
+special editions. These share the Aerox 3's report layout exactly — one command
+byte, one byte per DPI code — so the panel both writes the table and follows the
+physical button. The tracking half is unverified on everything but the Aerox 3.
+
+**Preset table, not tracked (12 ids).** Prime, Prime Mini, Prime+, Rival 3,
+Rival 3 Gen 2, Rival 3 Wireless, Sensei TEN. Editing works. Following the button
+does not, and is deliberately not attempted: these encode DPI as a plain number,
+or use a two-byte command whose echo is unknown, so any stray report would decode
+as a plausible DPI change rather than being rejected. The panel says so instead
+of guessing.
+
+**Two fixed slots (42 ids).** Rival 100 / 110 / 300 / 310 / 500 / 600 / 650 /
+700 / 95, Sensei 310, Sensei [RAW], Kana v2, Kinzu v2, and editions. These
+predate the preset table: they hold exactly two DPI slots, each written by its
+own command, and nothing on the wire names which one the button has selected.
+The panel shows both slots and edits either, without pretending to know or
+choose the active one. Devices whose DPI comes from a fixed list — the Kinzu v2
+takes 400, 800, 1600 or 3200 and nothing between — get those values as buttons
+rather than a stepper.
+
+Anything outside the tested tier is driven from rivalcfg's profile alone. That
+is enough to be confident about *what* gets sent, and the test suite checks the
+payload for all 34 preset-table devices, but it is not the same as having seen
+one land. The `first_preset` bug below is exactly the kind of thing no amount of
+offline testing would have caught.
 
 ## How it works
 
 ```
-Panel.qml ──> scripts/aerox3 ──> scripts/aerox3-device ──> rivalcfg ──> mouse
-     ^              |                     |
-     |              v                     | watch
-     |     ~/.local/state/omarchy/        |
-     └──── aerox3.json <──────────────────┘
+Panel.qml ──> scripts/steelseries ──> scripts/steelseries-device ──> rivalcfg ──> mouse
+     ^                |                          |
+     |                v                          | watch
+     |       ~/.local/state/omarchy/             |
+     └────── steelseries-mouse.json <────────────┘
 ```
 
-`scripts/aerox3` owns validation and the state file and speaks JSON.
-`scripts/aerox3-device` owns the hardware: writes through rivalcfg's library,
-and `watch` decodes DPI-button reports into JSON lines.
+`scripts/steelseries` owns validation and the state file and speaks JSON.
+`scripts/steelseries-device` owns the hardware: it reports the device's
+capabilities, writes through rivalcfg's library, and decodes DPI-button reports
+into JSON lines.
+
+The split matters for speed. Deciding whether a supported mouse is plugged in
+costs a Python process and a rivalcfg import; deciding whether any SteelSeries
+USB id is present at all costs a `sed` over sysfs. The wrapper does the cheap
+check on every call and caches the expensive answer against it, so the panel's
+routine `get` never starts an interpreter.
 
 ### Why not the rivalcfg CLI
 
 `rivalcfg --sensitivity 800,1200,1600` always activates the *first* preset.
 The underlying command carries a selected-preset byte that the CLI never
-exposes, so switching the active preset requires the library:
-
-```python
-mouse.set_sensitivity("800,1200,1600", selected_preset)
-```
+exposes, so switching the active preset requires the library.
 
 ### Reading the device
 
@@ -76,7 +121,14 @@ ad 03 01 12 1b 24 ...
 ```
 
 DPI codes are decoded by inverting rivalcfg's own `output_choices` table, so
-the decode cannot drift from the encode.
+the decode cannot drift from the encode. Every field is then checked against
+the profile — the count against the device's preset limit, the selection
+against the count, every DPI byte against the code table — because this is the
+one place an unrelated report from a shared interface could be mistaken for a
+DPI change.
+
+Consequently, before the first write or button press the state is unknown, and
+the panel says "Assumed" rather than presenting a default as fact.
 
 ### The selected-preset byte is 0-based
 
@@ -91,11 +143,12 @@ report index 0, `0x02` reports index 2, and rivalcfg's `0x03` for the last of
 three presets produces no response whatsoever.
 
 `sensitivity_payload()` therefore takes the DPI codes from rivalcfg and
-overwrites only that one byte. This looks like an upstream bug rather than
-something specific to this plugin.
-
-Consequently, before the first write or button press the state is unknown, and
-the panel says "Assumed" rather than presenting a default as fact.
+overwrites only that one byte — and only for a device listed in `VERIFIED`,
+whose real numbering has been checked. Every other device gets exactly the bytes
+rivalcfg would have sent, because a second guess about somebody else's hardware
+is worth less than upstream's first one. This looks like an upstream bug; the
+sibling Aerox 5 and Aerox 9 profiles declare `first_preset: 0` for the same
+protocol.
 
 ### Flash wear
 
@@ -103,28 +156,19 @@ the panel says "Assumed" rather than presenting a default as fact.
 switching presets is a frequent action, and the selection is re-asserted at
 startup anyway.
 
-## Device support
-
-**This plugin only supports the wired Aerox 3 (`1038:1836`).** The USB ids, the
-200–8500 DPI range, the five-preset limit, the notification report id, and the
-DPI lookup table are all specific to that model.
-
-Generalizing to other rivalcfg-supported mice is mostly mechanical — every one
-of those constants exists in rivalcfg's per-device profile — with one genuine
-unknown: whether other models emit the same button-press notification. That
-part is unverifiable without the hardware in hand.
-
-The Aerox 3 Wireless is a *different* product id (`1038:1838` / `1038:183a`)
-and is not supported.
-
 ## Development
 
 ```bash
 tests/run
 ```
 
-44 tests for the wrapper script (with the device helper stubbed, so no HID
-writes) and 9 for report decoding (using captured hardware fixtures).
+54 tests for the wrapper script and 34 for the device helper. The wrapper's
+device helper is stubbed and sysfs is faked, so the suite can never reach real
+hardware and can pretend any mouse is plugged in. The helper's tests use report
+fixtures captured from a real Aerox 3, then sweep all 76 profiles: capability
+derivation and payload building are pure functions of the profile, so a device
+nobody owns can still be checked for a missing field, a range that reads
+backwards, or a table the panel would render as an empty row.
 
 **Hot-reload is not reliable for structural QML changes.** The shell can keep
 serving a cached copy of `Panel.qml`, which looks like your edits silently
@@ -133,3 +177,7 @@ having no effect. When in doubt:
 ```bash
 omarchy restart shell
 ```
+
+## License
+
+MIT
