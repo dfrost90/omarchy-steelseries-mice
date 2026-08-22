@@ -468,31 +468,30 @@ Panel {
               onClicked: root.selectPreset(index)
               onRightClicked: root.removePreset(index)
 
-              // The handler has to sit on its own Item rather than on the
-              // chip. Button fills itself with a MouseArea, and a MouseArea
-              // accepts wheel events whether or not anyone handles them — so
-              // a handler on the chip is never reached. Declared here, this
-              // Item stacks above that MouseArea and sees the wheel first,
-              // while clicks fall straight through: a bare Item accepts no
-              // mouse buttons.
-              Item {
+              // A MouseArea, not a WheelHandler. Button fills itself with a
+              // MouseArea, and one MouseArea will not yield the wheel to a
+              // pointer handler underneath it however that handler is
+              // stacked — a WheelHandler here is simply never reached.
+              // acceptedButtons: Qt.NoButton leaves clicks to the Button.
+              MouseArea {
                 anchors.fill: parent
+                acceptedButtons: Qt.NoButton
 
-                WheelHandler {
-                  enabled: root.editable
-                  onWheel: function(event) {
-                    // Horizontal wheels and touchpad side-scrolls report
-                    // y === 0; without this every one would read as a step up.
-                    if (event.angleDelta.y === 0) return
-                    chip.wheelTravel += event.angleDelta.y
-                    while (chip.wheelTravel >= 120) {
-                      chip.wheelTravel -= 120
-                      root.nudgePreset(chip.index, 1)
-                    }
-                    while (chip.wheelTravel <= -120) {
-                      chip.wheelTravel += 120
-                      root.nudgePreset(chip.index, -1)
-                    }
+                onWheel: function(wheel) {
+                  if (!root.editable)
+                    return
+                  // Horizontal wheels and touchpad side-scrolls report
+                  // y === 0; without this every one would read as a step up.
+                  if (wheel.angleDelta.y === 0)
+                    return
+                  chip.wheelTravel += wheel.angleDelta.y
+                  while (chip.wheelTravel >= 120) {
+                    chip.wheelTravel -= 120
+                    root.nudgePreset(chip.index, 1)
+                  }
+                  while (chip.wheelTravel <= -120) {
+                    chip.wheelTravel += 120
+                    root.nudgePreset(chip.index, -1)
                   }
                 }
               }
