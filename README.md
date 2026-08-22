@@ -52,6 +52,22 @@ Bind a key to open the panel:
 omarchy-shell io.github.dfrost90.steelseries-mice toggle
 ```
 
+## Uninstall
+
+```bash
+omarchy plugin remove io.github.dfrost90.steelseries-mice
+```
+
+That takes the widget out of the bar and deletes the plugin directory. Two
+things are deliberately left behind, because neither belongs to the plugin:
+
+- `~/.local/state/omarchy/steelseries-mouse.json`, the remembered preset
+  table. Delete it by hand if you want it gone.
+- The DPI presets and polling rate already written to the mouse. They live in
+  the device's own flash and survive uninstalling, rebooting, and moving the
+  mouse to another machine. Use `rivalcfg --reset` to put the device back to
+  its factory defaults.
+
 ## Device support
 
 Every mouse rivalcfg knows — 76 USB ids — falls into one of three tiers.
