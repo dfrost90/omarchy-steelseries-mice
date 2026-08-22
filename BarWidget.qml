@@ -468,17 +468,31 @@ Panel {
               onClicked: root.selectPreset(index)
               onRightClicked: root.removePreset(index)
 
-              WheelHandler {
-                enabled: root.editable
-                onWheel: function(event) {
-                  chip.wheelTravel += event.angleDelta.y
-                  while (chip.wheelTravel >= 120) {
-                    chip.wheelTravel -= 120
-                    root.nudgePreset(chip.index, 1)
-                  }
-                  while (chip.wheelTravel <= -120) {
-                    chip.wheelTravel += 120
-                    root.nudgePreset(chip.index, -1)
+              // The handler has to sit on its own Item rather than on the
+              // chip. Button fills itself with a MouseArea, and a MouseArea
+              // accepts wheel events whether or not anyone handles them — so
+              // a handler on the chip is never reached. Declared here, this
+              // Item stacks above that MouseArea and sees the wheel first,
+              // while clicks fall straight through: a bare Item accepts no
+              // mouse buttons.
+              Item {
+                anchors.fill: parent
+
+                WheelHandler {
+                  enabled: root.editable
+                  onWheel: function(event) {
+                    // Horizontal wheels and touchpad side-scrolls report
+                    // y === 0; without this every one would read as a step up.
+                    if (event.angleDelta.y === 0) return
+                    chip.wheelTravel += event.angleDelta.y
+                    while (chip.wheelTravel >= 120) {
+                      chip.wheelTravel -= 120
+                      root.nudgePreset(chip.index, 1)
+                    }
+                    while (chip.wheelTravel <= -120) {
+                      chip.wheelTravel += 120
+                      root.nudgePreset(chip.index, -1)
+                    }
                   }
                 }
               }
