@@ -1,3 +1,5 @@
+pragma ComponentBehavior: Bound
+
 import QtQuick
 import Quickshell
 import Quickshell.Io
@@ -20,8 +22,8 @@ import qs.Commons
 // or press the state is flagged `assumed`.
 Panel {
   id: root
-  moduleName: "omarchyplugins.steelseries"
-  ipcTarget: "omarchyplugins.steelseries"
+  moduleName: "io.github.dfrost90.steelseries-mice"
+  ipcTarget: "io.github.dfrost90.steelseries-mice"
 
   readonly property string script: Quickshell.env("HOME")
     + "/.config/omarchy/plugins/" + moduleName + "/scripts/steelseries"
@@ -59,6 +61,15 @@ Panel {
   // hardware change the user never asked for.
   property bool ready: false
 
+  // A table being scrolled, not yet sent. One notch of the wheel is one DPI
+  // step, and a flick of the wheel is a dozen of them; writing each one would
+  // hammer the device with tables nobody asked to keep. The chips show this
+  // while it exists, so the number still moves under the cursor.
+  property var pendingPresets: null
+  readonly property var displayPresets: pendingPresets !== null ? pendingPresets : presets
+  readonly property int displayDpi: selected < displayPresets.length
+    ? displayPresets[selected] : activeDpi
+
   readonly property bool healthy: connected && haveHelper && lastError === ""
   readonly property bool editable: ready && healthy
   // A device with a fixed handful of DPI values takes nothing in between, so
@@ -94,24 +105,53 @@ Panel {
     run(["select", String(index)])
   }
 
-  function setPresetValue(index, value) {
+  // The next DPI one notch away, however this device counts them: along its
+  // step for a range, or along its own list where only a handful are legal.
+  function nextDpi(value, direction) {
+    if (root.discreteDpi) {
+      var at = root.dpiValues.indexOf(value)
+      if (at < 0) return root.dpiValues[0]
+      var moved = at + direction
+      if (moved < 0 || moved >= root.dpiValues.length) return value
+      return root.dpiValues[moved]
+    }
+    var stepped = value + direction * root.dpiStep
+    return Math.max(root.dpiMin, Math.min(root.dpiMax, stepped))
+  }
+
+  function nudgePreset(index, direction) {
     if (!editable) return
-    var next = root.presets.slice()
-    if (next[index] === value) return
-    next[index] = value
+    var next = root.displayPresets.slice()
+    var moved = nextDpi(next[index], direction)
+    if (moved === next[index]) return
+    next[index] = moved
+    root.pendingPresets = next
+    commitTimer.restart()
+  }
+
+  function commitPending() {
+    if (root.pendingPresets === null) return
+    // A write is already in flight and `run` would drop this one on the floor,
+    // leaving the panel showing a value the mouse never got.
+    if (writeProc.running) {
+      commitTimer.restart()
+      return
+    }
+    var next = root.pendingPresets
+    root.pendingPresets = null
     writePresets(next, root.selected)
   }
 
   function addPreset() {
-    if (!editable || root.presets.length >= root.presetMax) return
-    var next = root.presets.slice()
+    if (!editable || root.displayPresets.length >= root.presetMax) return
+    var next = root.displayPresets.slice()
     next.push(next[next.length - 1])
     writePresets(next, root.selected)
   }
 
   function removePreset(index) {
-    if (!editable || root.presets.length <= root.presetMin) return
-    var next = root.presets.slice()
+    if (!editable || root.displayPresets.length <= root.presetMin) return
+    var next = root.displayPresets.slice()
     next.splice(index, 1)
     // The table shrank under the selection; keep it inside the new bounds.
     var selection = root.selected >= next.length ? next.length - 1 : root.selected
@@ -119,6 +159,9 @@ Panel {
   }
 
   function writePresets(list, selection) {
+    // Whatever was being scrolled is part of this write or superseded by it.
+    root.pendingPresets = null
+    commitTimer.stop()
     root.presets = list
     root.selected = selection
     root.activeDpi = list[selection]
@@ -170,6 +213,10 @@ Panel {
     try { report = JSON.parse(line) } catch (e) { return }
     if (!report || !(report.presets instanceof Array)) return
 
+    // The device just told us what it holds, which outranks a half-finished
+    // scroll of ours.
+    root.pendingPresets = null
+    commitTimer.stop()
     root.presets = report.presets
     root.selected = report.selected
     root.activeDpi = report.presets[report.selected] || report.presets[0]
@@ -183,8 +230,9 @@ Panel {
     if (!connected) return "No supported SteelSeries mouse connected"
     if (lastError !== "") return lastError
     if (assumed) return "Assumed — nothing applied or observed yet"
-    if (!selectable) return presets.length + " fixed DPI slots · switched on the mouse"
-    return "Preset " + (selected + 1) + " of " + presets.length + " · " + activeDpi + " DPI"
+    if (!selectable) return displayPresets.length + " fixed DPI slots · switched on the mouse"
+    return "Preset " + (selected + 1) + " of " + displayPresets.length
+      + " · " + displayDpi + " DPI"
   }
 
   // Said plainly rather than hidden, because it is the one thing about this
@@ -247,6 +295,13 @@ Panel {
     }
   }
 
+  // Sends the scrolled table once the wheel has been still for a moment.
+  Timer {
+    id: commitTimer
+    interval: 350
+    onTriggered: root.commitPending()
+  }
+
   // The mouse can be plugged in after the shell starts, and nothing notifies
   // us. A slow poll is enough to make the widget appear on its own.
   Timer {
@@ -260,7 +315,7 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: "󰍽 " + (root.selectable ? root.activeDpi : root.presets.join("/"))
+    text: "󰍽 " + (root.selectable ? root.displayDpi : root.displayPresets.join("/"))
     active: root.opened
     dimmed: root.assumed
     tooltipText: root.deviceName + " · " + root.polling + " Hz"
@@ -282,7 +337,7 @@ Panel {
     contentWidth: popup.fittedContentWidth(
       column.implicitWidth + popup.padding * 2
         + Border.left(popup.borderSpec) + Border.right(popup.borderSpec),
-      Style.space(320))
+      Style.space(420))
     contentHeight: popup.fittedContentHeight(column.implicitHeight)
 
     PanelKeyCatcher {
@@ -344,90 +399,75 @@ Panel {
           fontFamily: root.fontFamily
         }
 
-        Repeater {
-          model: root.presets.length
+        // One chip per preset, laid out like the polling row below: the
+        // highlighted chip is the active preset, so the value and the marker
+        // are the same object rather than a dot beside a spinbox.
+        //
+        // A Grid rather than a Row so a fourth and fifth preset wrap instead
+        // of widening the panel. Three columns is the whole point: the panel
+        // settles at one width and stays there whatever the table holds. A
+        // Flow would wrap too, but its width would have to come from the
+        // column that is itself sized by this content.
+        Grid {
+          columns: 3
+          spacing: Style.spacing.md
 
-          Row {
-            id: presetRow
-            required property int index
+          Repeater {
+            model: root.displayPresets.length
 
-            width: column.width
-            spacing: Style.spacing.controlGap
+            Button {
+              id: chip
+              required property int index
+              readonly property int dpi: index < root.displayPresets.length
+                ? root.displayPresets[index] : root.dpiMin
+              // Wheels report in eighths of a degree and a notch is 120 of
+              // them; a touchpad sends far smaller slices. Accumulating means
+              // one notch is one step on either.
+              property real wheelTravel: 0
 
-            // Click the marker to make this preset the active one — the same
-            // thing the button behind the scroll wheel does. Devices that
-            // cannot be told which slot is live get a plain number instead of
-            // a control that would do nothing.
-            Text {
-              anchors.verticalCenter: parent.verticalCenter
-              width: Style.space(18)
-              text: root.selectable
-                ? (presetRow.index === root.selected ? "●" : "○")
-                : String(presetRow.index + 1)
-              color: root.selectable && presetRow.index === root.selected
-                ? root.panelFg : root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.body
-
-              MouseArea {
-                anchors.fill: parent
-                cursorShape: Qt.PointingHandCursor
-                enabled: root.editable && root.selectable
-                onClicked: root.selectPreset(presetRow.index)
+              function gestures() {
+                var parts = ["Scroll to change"]
+                if (root.selectable) parts.push("click to activate")
+                // Right-click is invisible and removal cannot be undone, so
+                // the tooltip is the only thing standing between the gesture
+                // and a preset quietly disappearing. It says so always, not
+                // only while a removal is possible.
+                if (root.resizable) parts.push("right-click to remove")
+                return parts.join(" · ")
               }
-            }
 
-            NumberField {
-              anchors.verticalCenter: parent.verticalCenter
-              visible: !root.discreteDpi
-              value: presetRow.index < root.presets.length
-                ? root.presets[presetRow.index] : root.dpiMin
-              from: root.dpiMin
-              to: root.dpiMax
-              stepSize: root.dpiStep
-              foreground: root.panelFg
-              accent: Color.accent
-              fontFamily: root.fontFamily
-              fontSize: Style.font.bodySmall
-              // SpinBox formats through its locale, which groups thousands:
-              // "1,200" reads as two values rather than one DPI figure.
-              Component.onCompleted: field.locale = Qt.locale("C")
-              onModified: function(value) { root.setPresetValue(presetRow.index, value) }
-            }
-
-            ButtonGroup {
-              anchors.verticalCenter: parent.verticalCenter
-              visible: root.discreteDpi
-              options: root.dpiValues.map(String)
-              value: presetRow.index < root.presets.length
-                ? String(root.presets[presetRow.index]) : ""
+              text: String(chip.dpi)
+              bordered: true
+              selected: root.selectable && index === root.selected
               foreground: root.panelFg
               background: root.bar ? root.bar.background : Color.background
               accent: Color.accent
               fontFamily: root.fontFamily
               fontSize: Style.font.bodySmall
-              focusable: false
+              tooltipText: chip.gestures()
+              onClicked: root.selectPreset(index)
+              onRightClicked: root.removePreset(index)
 
-              onChanged: function(value) {
-                root.setPresetValue(presetRow.index, parseInt(value, 10))
+              WheelHandler {
+                enabled: root.editable
+                onWheel: function(event) {
+                  chip.wheelTravel += event.angleDelta.y
+                  while (chip.wheelTravel >= 120) {
+                    chip.wheelTravel -= 120
+                    root.nudgePreset(chip.index, 1)
+                  }
+                  while (chip.wheelTravel <= -120) {
+                    chip.wheelTravel += 120
+                    root.nudgePreset(chip.index, -1)
+                  }
+                }
               }
-            }
-
-            Button {
-              anchors.verticalCenter: parent.verticalCenter
-              visible: root.presets.length > root.presetMin
-              iconText: "×"
-              tooltipText: "Remove this preset"
-              foreground: root.panelFg
-              accent: Color.accent
-              fontFamily: root.fontFamily
-              onClicked: root.removePreset(presetRow.index)
             }
           }
         }
 
         Button {
-          visible: root.resizable && root.presets.length < root.presetMax
+          visible: root.resizable && root.displayPresets.length < root.presetMax
           text: "+ add preset"
           foreground: root.panelFg
           accent: Color.accent

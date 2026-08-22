@@ -1,4 +1,4 @@
-# SteelSeries Mouse
+# Omarchy SteelSeries Mice
 
 Omarchy shell plugin for SteelSeries mice: edit the DPI preset table and
 polling rate from the bar, and follow the physical DPI button live.
@@ -8,9 +8,17 @@ polling rate from the bar, and follow the physical DPI button live.
 ## What it does
 
 Modern SteelSeries mice hold up to five DPI presets and cycle between them when
-you press the button behind the scroll wheel. The panel shows that table, marks
-the active preset, and lets you edit any value, add or remove presets, and
-change the polling rate.
+you press the button behind the scroll wheel. The panel shows that table as a
+row of chips, highlights the active one, and lets you edit it:
+
+| Gesture on a chip | Effect |
+|---|---|
+| Click | Make this preset the active one |
+| Scroll | Change its DPI, one step of the device's own resolution per notch |
+| Right-click | Remove it (the last remaining preset stays put) |
+
+Scrolling is collected and sent once the wheel stops, so a flick through a
+hundred steps is one write, not a hundred.
 
 Press the physical button and the panel follows — the mouse pushes an
 unsolicited HID report on every press carrying both the active index and the
@@ -35,13 +43,13 @@ and the panel draws itself from that.
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/dfrost90/omarchy-aerox3.git --enable
+omarchy plugin add https://github.com/dfrost90/omarchy-steelseries-mice.git --enable
 ```
 
 Bind a key to open the panel:
 
 ```
-omarchy-shell omarchyplugins.steelseries toggle
+omarchy-shell io.github.dfrost90.steelseries-mice toggle
 ```
 
 ## Device support
@@ -70,9 +78,9 @@ of guessing.
 predate the preset table: they hold exactly two DPI slots, each written by its
 own command, and nothing on the wire names which one the button has selected.
 The panel shows both slots and edits either, without pretending to know or
-choose the active one. Devices whose DPI comes from a fixed list — the Kinzu v2
-takes 400, 800, 1600 or 3200 and nothing between — get those values as buttons
-rather than a stepper.
+choose the active one. Where the device takes a fixed list of DPI values rather
+than a range — the Kinzu v2 accepts 400, 800, 1600 or 3200 and nothing between —
+scrolling steps along that list instead of along a step size.
 
 Anything outside the tested tier is driven from rivalcfg's profile alone. That
 is enough to be confident about *what* gets sent, and the test suite checks the
@@ -161,6 +169,18 @@ startup anyway.
 ```bash
 tests/run
 ```
+
+Quickshell resolves the `qs` import to the shell at runtime; `qmllint` has to be
+told, so linting takes a scratch root:
+
+```bash
+mkdir -p /tmp/qmlroot && ln -sfn ~/.local/share/omarchy/shell /tmp/qmlroot/qs
+qmllint -I /tmp/qmlroot -I /usr/lib/qt6/qml Panel.qml
+```
+
+What remains are `Style`/`Color` singleton lookups and one Quickshell `Process`
+signal type that qmllint cannot introspect statically — the same warnings the
+first-party Omarchy plugins produce, in larger numbers.
 
 54 tests for the wrapper script and 34 for the device helper. The wrapper's
 device helper is stubbed and sysfs is faked, so the suite can never reach real

@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
-  "id": "omarchyplugins.steelseries",
-  "name": "SteelSeries Mouse",
+  "id": "io.github.dfrost90.steelseries-mice",
+  "name": "SteelSeries Mice",
   "version": "2.0.0",
   "author": "dfrost",
   "license": "MIT",
-  "homepage": "https://github.com/dfrost90/omarchy-aerox3",
+  "homepage": "https://github.com/dfrost90/omarchy-steelseries-mice",
   "description": "DPI presets and polling rate for SteelSeries mice, driven by rivalcfg",
   "kinds": [
     "bar-widget"
@@ -15,7 +15,7 @@
   },
   "barWidget": {
     "displayName": "Mouse DPI",
-    "description": "SteelSeries mouse DPI and polling rate. Click to adjust.",
+    "description": "SteelSeries mouse DPI presets and polling rate. Click to adjust.",
     "category": "Hardware",
     "defaultSection": "right",
     "allowMultiple": false
