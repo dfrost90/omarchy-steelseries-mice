@@ -248,6 +248,16 @@ Panel {
     return "Untested model, driven from rivalcfg's profile."
   }
 
+  // Shown under the section header rather than in a tooltip: right-click
+  // removes a preset with no way back, so it should not need hovering to
+  // discover. Only the invisible gestures are listed — a chip already looks
+  // like a button, and a third line of hint costs more than it explains.
+  function gestureHint() {
+    var parts = ["Scroll to change"]
+    if (resizable) parts.push("right-click to remove")
+    return parts.join(" · ")
+  }
+
   visible: connected
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -418,6 +428,16 @@ Panel {
           fontFamily: root.fontFamily
         }
 
+        Text {
+          width: parent.width
+          visible: root.editable
+          text: root.gestureHint()
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.Wrap
+        }
+
         // One chip per preset, laid out like the polling row below: the
         // highlighted chip is the active preset, so the value and the marker
         // are the same object rather than a dot beside a spinbox.
@@ -444,17 +464,6 @@ Panel {
               // one notch is one step on either.
               property real wheelTravel: 0
 
-              function gestures() {
-                var parts = ["Scroll to change"]
-                if (root.selectable) parts.push("click to activate")
-                // Right-click is invisible and removal cannot be undone, so
-                // the tooltip is the only thing standing between the gesture
-                // and a preset quietly disappearing. It says so always, not
-                // only while a removal is possible.
-                if (root.resizable) parts.push("right-click to remove")
-                return parts.join(" · ")
-              }
-
               text: String(chip.dpi)
               width: chipSizer.implicitWidth
               bordered: true
@@ -464,7 +473,6 @@ Panel {
               accent: Color.accent
               fontFamily: root.fontFamily
               fontSize: Style.font.bodySmall
-              tooltipText: chip.gestures()
               onClicked: root.selectPreset(index)
               onRightClicked: root.removePreset(index)
 
