@@ -30,6 +30,7 @@ import select
 import sys
 
 HIDRAW_DIR = os.environ.get("STEELSERIES_HIDRAW_DIR", "/sys/class/hidraw")
+UEVENT_MAX_BYTES = 65536
 
 # Devices whose behaviour has been checked against real hardware. Everything
 # else is driven from rivalcfg's profile alone, which is enough to write
@@ -264,7 +265,10 @@ def hidraw_nodes(ident):
         uevent = os.path.join(HIDRAW_DIR, name, "device", "uevent")
         try:
             with open(uevent) as handle:
-                content = handle.read()
+                # Bounded like every other read here. A real uevent is a few
+                # hundred bytes; the directory this walks is only sysfs by
+                # default, and the default is overridable.
+                content = handle.read(UEVENT_MAX_BYTES)
         except OSError:
             continue
         for line in content.splitlines():

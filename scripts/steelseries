@@ -30,6 +30,15 @@ set -uo pipefail
 readonly STATE_VERSION=2
 readonly VENDOR_ID=1038
 
+# Ceilings on everything read from outside this script. The state file is ours
+# and a real one is a few hundred bytes, but it lives in a writable directory,
+# and the device helper is a separate program that could be replaced or simply
+# break. Neither is trusted to be small: an unbounded read hands a local
+# process a way to exhaust memory here, or the disk via the stderr capture.
+# Both limits are far above any legitimate value.
+readonly STATE_MAX_BYTES=${STEELSERIES_STATE_MAX_BYTES:-262144}
+readonly HELPER_STDERR_MAX_BYTES=${STEELSERIES_STDERR_MAX_BYTES:-8192}
+
 STATE_FILE="${STEELSERIES_STATE_FILE:-${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/steelseries-mouse.json}"
 HIDRAW_DIR="${STEELSERIES_HIDRAW_DIR:-/sys/class/hidraw}"
 DEVICE_BIN="${STEELSERIES_DEVICE:-$(dirname "$(readlink -f "$0")")/steelseries-device}"
@@ -204,7 +213,8 @@ read_state() {
           | [((.presets // []) | map(tostring) | join(",")),
              (.selected // ""), (.polling // ""),
              (.appliedAt // ""), (.observedAt // ""), (.error // "")]
-          | map(tostring) | join("\u0000") + "\u0000"' "$STATE_FILE" 2>/dev/null)
+          | map(tostring) | join("\u0000") + "\u0000"' \
+          < <(head -c "$STATE_MAX_BYTES" "$STATE_FILE") 2>/dev/null)
 
   [[ "$polling" =~ ^[0-9]+$ ]] && state_polling=$polling
   state_error=$err
@@ -245,7 +255,8 @@ write_state() {
   # Other devices' entries survive: unplugging one mouse and plugging another
   # should not throw away what we knew about the first.
   if [ -r "$STATE_FILE" ]; then
-    existing=$(jq -c 'select(.version == 2) | {devices: (.devices // {})}' "$STATE_FILE" 2>/dev/null)
+    existing=$(jq -c 'select(.version == 2) | {devices: (.devices // {})}' \
+      < <(head -c "$STATE_MAX_BYTES" "$STATE_FILE") 2>/dev/null)
     [ -n "$existing" ] || existing='{}'
   fi
 
@@ -394,8 +405,13 @@ device() {
   have_device_helper || die "device helper not found: $DEVICE_BIN"
 
   stderr_file=$(mktemp)
-  "$DEVICE_BIN" "$@" >/dev/null 2>"$stderr_file"
-  rc=$?
+  # Through head, so a helper stuck in a logging loop cannot fill the disk:
+  # the cap applies as the bytes are written, not after. 2>&1 1>/dev/null
+  # puts stderr on the pipe and discards stdout, and PIPESTATUS keeps the
+  # helper's exit status rather than head's.
+  { "$DEVICE_BIN" "$@" 2>&1 1>/dev/null \
+      | head -c "$HELPER_STDERR_MAX_BYTES" >"$stderr_file"; }
+  rc=${PIPESTATUS[0]}
   output=$(tr -d '\r' <"$stderr_file" | grep -v '^[[:space:]]*$' | tail -1)
   rm -f "$stderr_file"
 

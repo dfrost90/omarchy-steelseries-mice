@@ -175,8 +175,31 @@ Panel {
     run(["set", "--polling", String(next)])
   }
 
+  // Ceilings on everything crossing into this long-lived process. The shell
+  // wrapper bounds what it reads, but the panel outlives every helper run and
+  // retains what they emit, so a helper that misbehaves once would otherwise
+  // leave the shell holding the result until logout.
+  readonly property int maxPayloadBytes: 262144
+  readonly property int maxMessageChars: 2000
+
+  // Qt Text defaults to Text.AutoText, which sniffs the string and switches to
+  // rich text if it looks like markup — and rich text loads external
+  // resources. Every sink we own is pinned to Text.PlainText; this exists for
+  // the ones we do not, notably the shared tooltip, whose Text has no
+  // textFormat of its own. Truncating here too keeps an absurd device name out
+  // of a tooltip that would try to lay all of it out.
+  function plain(value) {
+    var out = String(value === undefined || value === null ? "" : value)
+    if (out.length > root.maxMessageChars)
+      out = out.slice(0, root.maxMessageChars) + "…"
+    return out.replace(/[<>&]/g, " ")
+  }
+
   function applyState(text) {
     var state = null
+    // A get that came back enormous is a broken helper, not a big mouse.
+    // Parsing it would retain it; dropping it costs one refresh.
+    if (String(text).length > root.maxPayloadBytes) return
     try { state = JSON.parse(text) } catch (e) { return }
     if (!state || !(state.presets instanceof Array)) return
 
@@ -187,11 +210,11 @@ Panel {
     root.assumed = state.assumed === true
     root.connected = state.connected === true
     root.haveHelper = state.helper === true
-    root.lastError = String(state.error || "")
-    root.appliedAt = String(state.appliedAt || "")
+    root.lastError = root.plain(state.error || "")
+    root.appliedAt = root.plain(state.appliedAt || "")
 
-    if (state.name) root.deviceName = String(state.name)
-    if (state.mode) root.mode = String(state.mode)
+    if (state.name) root.deviceName = root.plain(state.name)
+    if (state.mode) root.mode = root.plain(state.mode)
     if (state.dpiMin > 0) root.dpiMin = state.dpiMin
     if (state.dpiMax > 0) root.dpiMax = state.dpiMax
     root.dpiStep = state.dpiStep > 0 ? state.dpiStep : 1
@@ -210,6 +233,10 @@ Panel {
   // A press of the physical DPI button arrives here as one JSON line.
   function observed(line) {
     var report = null
+    // SplitParser buffers until its marker arrives, so a helper emitting a
+    // long line without a newline would grow without bound. One report is a
+    // hundred bytes; anything of this size is not one.
+    if (String(line).length > root.maxPayloadBytes) return
     try { report = JSON.parse(line) } catch (e) { return }
     if (!report || !(report.presets instanceof Array)) return
 
@@ -281,7 +308,7 @@ Panel {
     stderr: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        var message = String(text || "").trim()
+        var message = root.plain(String(text || "").trim())
         if (message !== "") root.lastError = message.replace(/^steelseries: /, "")
       }
     }
@@ -328,7 +355,7 @@ Panel {
     text: "󰍽 " + (root.selectable ? root.displayDpi : root.displayPresets.join("/"))
     active: root.opened
     dimmed: root.assumed
-    tooltipText: root.deviceName + " · " + root.polling + " Hz"
+    tooltipText: root.plain(root.deviceName) + " · " + root.polling + " Hz"
     onPressed: function(b) { root.toggle() }
   }
 
@@ -385,6 +412,7 @@ Panel {
 
           Text {
             id: title
+            textFormat: Text.PlainText
             text: root.deviceName
             color: root.panelFg
             font.family: root.fontFamily
@@ -393,6 +421,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             anchors.baseline: title.baseline
             text: root.busy ? "applying…" : ""
             color: root.dim
@@ -402,6 +431,7 @@ Panel {
         }
 
         Text {
+          textFormat: Text.PlainText
           width: parent.width
           text: root.statusLine()
           color: root.healthy ? root.dim : root.urgent
@@ -411,6 +441,7 @@ Panel {
         }
 
         Text {
+          textFormat: Text.PlainText
           width: parent.width
           visible: text !== ""
           text: root.caveatLine()
@@ -429,6 +460,7 @@ Panel {
         }
 
         Text {
+          textFormat: Text.PlainText
           width: parent.width
           visible: root.editable
           text: root.gestureHint()
