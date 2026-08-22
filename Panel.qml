@@ -345,6 +345,25 @@ Panel {
       anchors.fill: parent
       onCloseRequested: root.close()
 
+      // Never drawn: it exists so every chip can borrow one width.
+      //
+      // A Grid sizes each column to its widest cell and leaves narrower ones
+      // sitting at the left of the gap, so a three-digit 800 beside a
+      // four-digit 3200 pulls the rows out of line. Measuring the widest DPI
+      // this device can hold — rather than the widest it currently holds —
+      // also keeps the chips and the panel still while a value is scrolled
+      // past a digit boundary. Borrowing a real Button rather than computing
+      // from a font metric means the padding and border arithmetic stays
+      // wherever Button keeps it.
+      Button {
+        id: chipSizer
+        visible: false
+        bordered: true
+        text: String(root.dpiMax)
+        fontFamily: root.fontFamily
+        fontSize: Style.font.bodySmall
+      }
+
       Column {
         id: column
         anchors.fill: parent
@@ -437,6 +456,7 @@ Panel {
               }
 
               text: String(chip.dpi)
+              width: chipSizer.implicitWidth
               bordered: true
               selected: root.selectable && index === root.selected
               foreground: root.panelFg
