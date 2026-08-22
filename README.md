@@ -91,7 +91,7 @@ offline testing would have caught.
 ## How it works
 
 ```
-Panel.qml ──> scripts/steelseries ──> scripts/steelseries-device ──> rivalcfg ──> mouse
+BarWidget.qml ──> scripts/steelseries ──> scripts/steelseries-device ──> rivalcfg ──> mouse
      ^                |                          |
      |                v                          | watch
      |       ~/.local/state/omarchy/             |
@@ -175,7 +175,7 @@ told, so linting takes a scratch root:
 
 ```bash
 mkdir -p /tmp/qmlroot && ln -sfn ~/.local/share/omarchy/shell /tmp/qmlroot/qs
-qmllint -I /tmp/qmlroot -I /usr/lib/qt6/qml Panel.qml
+qmllint -I /tmp/qmlroot -I /usr/lib/qt6/qml BarWidget.qml
 ```
 
 What remains are `Style`/`Color` singleton lookups and one Quickshell `Process`
@@ -191,7 +191,7 @@ nobody owns can still be checked for a missing field, a range that reads
 backwards, or a table the panel would render as an empty row.
 
 **Hot-reload is not reliable for structural QML changes.** The shell can keep
-serving a cached copy of `Panel.qml`, which looks like your edits silently
+serving a cached copy of `BarWidget.qml`, which looks like your edits silently
 having no effect. When in doubt:
 
 ```bash
