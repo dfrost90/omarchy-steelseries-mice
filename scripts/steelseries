@@ -27,6 +27,13 @@
 
 set -uo pipefail
 
+# The ceilings below are denominated in bytes, and ${#var} only counts bytes in
+# the C locale — anywhere else it counts characters, so a file full of
+# multibyte text would measure short and slip past a limit it exceeds.
+# Deliberately not exported: this is about how bash counts, and the helper
+# should keep the user's locale.
+LC_ALL=C
+
 readonly STATE_VERSION=2
 readonly VENDOR_ID=1038
 
@@ -35,9 +42,17 @@ readonly VENDOR_ID=1038
 # and the device helper is a separate program that could be replaced or simply
 # break. Neither is trusted to be small: an unbounded read hands a local
 # process a way to exhaust memory here, or the disk via the stderr capture.
-# Both limits are far above any legitimate value.
+#
+# The line ceiling is the odd one out. It bounds nothing in this process — it
+# exists because the panel reading `watch` buffers until a newline arrives and
+# has no ceiling of its own, so this is where that newline has to come from.
+#
+# Every limit is far above any legitimate value.
 readonly STATE_MAX_BYTES=${STEELSERIES_STATE_MAX_BYTES:-262144}
+readonly HELPER_STDOUT_MAX_BYTES=${STEELSERIES_STDOUT_MAX_BYTES:-65536}
 readonly HELPER_STDERR_MAX_BYTES=${STEELSERIES_STDERR_MAX_BYTES:-8192}
+readonly HELPER_LINE_MAX_BYTES=${STEELSERIES_LINE_MAX_BYTES:-4096}
+readonly UEVENT_MAX_BYTES=${STEELSERIES_UEVENT_MAX_BYTES:-65536}
 
 STATE_FILE="${STEELSERIES_STATE_FILE:-${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/steelseries-mouse.json}"
 HIDRAW_DIR="${STEELSERIES_HIDRAW_DIR:-/sys/class/hidraw}"
@@ -84,6 +99,7 @@ usage: steelseries <command>
   select I                     activate a stored preset (0-based)
   observe I [--presets ...]    record what the mouse reported
   apply                        re-assert the stored state
+  watch                        stream DPI button presses, one JSON line each
 
   Limits come from the connected device: run `get` to see the DPI range,
   how many presets it holds, and which polling rates it accepts.
@@ -95,8 +111,38 @@ die() {
   exit 1
 }
 
+# The ceilings are used as arithmetic operands, and bash evaluates those as
+# expressions rather than reading them as numbers — an array subscript inside
+# one is a command substitution. They come from the environment, which is no
+# boundary at all, but a limit that is not a number is a bug however it got
+# there, and this is the one place to notice.
+for limit in STATE_MAX_BYTES HELPER_STDOUT_MAX_BYTES HELPER_STDERR_MAX_BYTES \
+  HELPER_LINE_MAX_BYTES UEVENT_MAX_BYTES; do
+  [[ "${!limit}" =~ ^[1-9][0-9]*$ ]] ||
+    die "$limit must be a positive whole number, got: ${!limit}"
+done
+unset limit
+
 have_device_helper() {
   command -v "$DEVICE_BIN" >/dev/null 2>&1
+}
+
+# A file read whole, or refused — never truncated to the ceiling.
+#
+# `head -c "$limit"` alone cannot tell a file that is exactly the ceiling from
+# one cut off at it, and a cut-off prefix can still be complete JSON: the rest
+# of the file would then be read as though it had never existed, and the next
+# write would put that back on disk as the whole truth. Asking for one byte
+# more than we will accept is what makes that case visible, and visible is what
+# makes it refusable.
+read_capped() {
+  local file=$1 limit=$2 data=""
+  # `read` reports success only when it found the NUL it was told to stop at.
+  # Nothing this script writes contains one, and a prefix cut at one is no more
+  # the file than a prefix cut at the ceiling is, so that is a refusal too.
+  IFS= read -r -d '' data < <(head -c "$((limit + 1))" "$file" 2>/dev/null) && return 1
+  ((${#data} > limit)) && return 1
+  printf '%s' "$data"
 }
 
 # Which SteelSeries USB ids are plugged in, as one sorted string.
@@ -105,11 +151,16 @@ have_device_helper() {
 # every single invocation. Deciding whether those ids are a *supported* mouse
 # costs a Python process and a rivalcfg import, so that answer is cached
 # against this key and recomputed only when the key changes.
+#
+# Bounded like everything else read from outside, and to the same figure the
+# helper uses for these same files: a real uevent is a few hundred bytes, and
+# the directory this walks is only sysfs until someone overrides it.
 probe_devices() {
   local uevent id ids=()
   for uevent in "$HIDRAW_DIR"/*/device/uevent; do
     [ -r "$uevent" ] || continue
-    id=$(sed -n "s/^HID_ID=[^:]*:0*\(${VENDOR_ID}\):0*\([0-9A-Fa-f]\+\)\$/\1:\2/p" "$uevent" | head -1)
+    id=$(sed -n "s/^HID_ID=[^:]*:0*\(${VENDOR_ID}\):0*\([0-9A-Fa-f]\+\)\$/\1:\2/p" \
+      < <(head -c "$UEVENT_MAX_BYTES" "$uevent") | head -1)
     [ -n "$id" ] && ids+=("${id,,}")
   done
   ((${#ids[@]})) || return 0
@@ -125,14 +176,27 @@ load_capabilities() {
   [ -n "$key" ] || return 0
 
   if [ -r "$STATE_FILE" ]; then
-    cached=$(jq -c --arg key "$key" \
-      'select(.version == 2 and .probeKey == $key) | .capabilities // empty' \
-      "$STATE_FILE" 2>/dev/null)
+    cached=$(read_capped "$STATE_FILE" "$STATE_MAX_BYTES" |
+      jq -c --arg key "$key" \
+        'select(.version == 2 and .probeKey == $key) | .capabilities // empty' \
+        2>/dev/null)
+    # This is the helper's own answer, cached, so it gets the helper's ceiling
+    # rather than the state file's — which is four times larger and would let
+    # a blob through that emit_state cannot pass to jq at all, execve refusing
+    # any single argument past 128K. Dropping it here asks the helper again.
+    ((${#cached} > HELPER_STDOUT_MAX_BYTES)) && cached=""
   fi
 
   if [ -z "$cached" ]; then
     have_device_helper || return 0
-    cached=$("$DEVICE_BIN" capabilities 2>/dev/null)
+    # Bounded for the same reason the state file is, and more pressingly: what
+    # lands here becomes cap_json, which `get` prints to the panel and
+    # write_state puts back on disk, so an unbounded answer would not stop
+    # here. head closing the pipe early is the point — a helper still talking
+    # into it gets SIGPIPE.
+    cached=$("$DEVICE_BIN" capabilities 2>/dev/null |
+      head -c "$((HELPER_STDOUT_MAX_BYTES + 1))")
+    ((${#cached} > HELPER_STDOUT_MAX_BYTES)) && return 0
     jq -e . >/dev/null 2>&1 <<<"$cached" || return 0
   fi
 
@@ -214,7 +278,7 @@ read_state() {
              (.selected // ""), (.polling // ""),
              (.appliedAt // ""), (.observedAt // ""), (.error // "")]
           | map(tostring) | join("\u0000") + "\u0000"' \
-          < <(head -c "$STATE_MAX_BYTES" "$STATE_FILE") 2>/dev/null)
+          < <(read_capped "$STATE_FILE" "$STATE_MAX_BYTES") 2>/dev/null)
 
   [[ "$polling" =~ ^[0-9]+$ ]] && state_polling=$polling
   state_error=$err
@@ -225,6 +289,16 @@ read_state() {
   # though the user had chosen it.
   [[ "$presets" =~ ^[0-9]+(,[0-9]+)*$ ]] || return 0
 
+  # Shape is not enough: the regex says nothing about how many. A table longer
+  # than the device holds is not one this script wrote, and reading it back is
+  # worse than dropping it — the panel draws one chip per entry, so a stored
+  # table of twenty thousand is twenty thousand QML objects and a shell that
+  # stops answering, and emit_state would hand jq a single argument past the
+  # 128K execve takes before it ever got that far.
+  local count
+  count=$(preset_count "$presets")
+  ((count <= cap_preset_max)) || return 0
+
   state_presets=$presets
   [[ "$selected" =~ ^[0-9]+$ ]] && state_selected=$selected
   state_applied=$applied
@@ -232,8 +306,6 @@ read_state() {
 
   # A table that shrank out from under a stored selection would otherwise
   # index past its end.
-  local count
-  count=$(preset_count "$state_presets")
   ((state_selected >= count)) && state_selected=$((count - 1))
 }
 
@@ -254,15 +326,25 @@ write_state() {
 
   # Other devices' entries survive: unplugging one mouse and plugging another
   # should not throw away what we knew about the first.
+  #
+  # A file too large to read whole is the one case worth refusing outright.
+  # Unparseable is recoverable — we wrote it, so we can write it again — but a
+  # quarter-megabyte of something is not a file this script produced, and
+  # rewriting it from the part we could see would delete the rest.
   if [ -r "$STATE_FILE" ]; then
+    existing=$(read_capped "$STATE_FILE" "$STATE_MAX_BYTES") ||
+      die "state file is not one this script wrote; refusing to overwrite: $STATE_FILE"
     existing=$(jq -c 'select(.version == 2) | {devices: (.devices // {})}' \
-      < <(head -c "$STATE_MAX_BYTES" "$STATE_FILE") 2>/dev/null)
+      <<<"$existing" 2>/dev/null)
     [ -n "$existing" ] || existing='{}'
   fi
 
+  # The device map arrives on stdin rather than as an argument. It is the one
+  # value here that grows with the file — every mouse ever plugged in keeps an
+  # entry — and execve refuses any single argument past 128K, so a large enough
+  # map would fail every write from then on rather than any one of them.
   tmp=$(mktemp "$STATE_FILE.XXXXXX") || die "cannot write state file"
-  jq -n \
-    --argjson existing "$existing" \
+  jq \
     --argjson version "$STATE_VERSION" \
     --arg probeKey "$probe_key" \
     --argjson capabilities "$cap_json" \
@@ -274,10 +356,10 @@ write_state() {
     --arg observedAt "$state_observed" \
     --arg error "$state_error" \
     '{version: $version, probeKey: $probeKey, capabilities: $capabilities,
-      devices: (($existing.devices // {}) + {
+      devices: ((.devices // {}) + {
         ($device): {presets: $presets, selected: $selected, polling: $polling,
                     appliedAt: $appliedAt, observedAt: $observedAt, error: $error}
-      })}' >"$tmp" &&
+      })}' <<<"$existing" >"$tmp" &&
     mv "$tmp" "$STATE_FILE" || {
     rm -f "$tmp"
     die "cannot write state file: $STATE_FILE"
@@ -571,6 +653,34 @@ cmd_apply() {
   emit_state
 }
 
+# Stream what the mouse reports about its own DPI button, one JSON object per
+# line, until killed. The panel keeps this running for as long as the shell is.
+#
+# `exec` is load-bearing: it makes the helper *be* this process rather than a
+# child of it, so the panel terminating the command it launched reaches the
+# helper directly. A shell left in between would die on that signal and orphan
+# the helper, which only notices its reader is gone the next time it writes —
+# and it writes only when the button is pressed.
+#
+# The panel's reader buffers until a newline arrives and has no ceiling of its
+# own, so a helper that stopped sending newlines would grow that buffer without
+# bound; a length check applied to a line once delivered is a check that never
+# runs. fold supplies the newline itself every HELPER_LINE_MAX_BYTES bytes. It
+# holds one line's width and no more, so nothing accumulates at either end, and
+# an oversized report arrives as fragments that fail to parse. stdbuf is what
+# stops fold batching real presses behind a block buffer until 4K of them have
+# piled up.
+cmd_watch() {
+  local tool
+  have_device_helper || die "device helper not found: $DEVICE_BIN"
+  for tool in stdbuf fold; do
+    command -v "$tool" >/dev/null 2>&1 ||
+      die "$tool is needed to bound the watch stream (both ship with coreutils)"
+  done
+
+  exec "$DEVICE_BIN" watch > >(stdbuf -oL fold -b -w "$HELPER_LINE_MAX_BYTES")
+}
+
 main() {
   local command=${1:-}
   [ $# -gt 0 ] && shift
@@ -584,6 +694,7 @@ main() {
     select) cmd_select "$@" ;;
     observe) cmd_observe "$@" ;;
     apply) cmd_apply "$@" ;;
+    watch) cmd_watch "$@" ;;
     -h | --help) usage ;;
     *)
       usage >&2

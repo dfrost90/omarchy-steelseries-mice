@@ -419,6 +419,166 @@ check "a missing device helper is reported" \
   "false" "$("$STEELSERIES" get | jq -r .helper)"
 teardown
 
+# --- ceilings on what we read ----------------------------------------------
+#
+# Every ceiling here is overridden down to something a test can build, so these
+# exercise the boundary itself rather than a quarter of a megabyte of padding.
+
+setup
+"$STEELSERIES" set --presets 800,1200 >/dev/null 2>&1
+size=$(wc -c <"$STATE_FILE")
+head -c 100 /dev/zero | tr '\0' 'X' >>"$STATE_FILE"
+check "a state file whose first bytes parse is still refused for its size" \
+  "800 1600" \
+  "$(STEELSERIES_STATE_MAX_BYTES=$size "$STEELSERIES" get | jq -r '.presets | join(" ")')"
+teardown
+
+setup
+"$STEELSERIES" set --presets 800,1200 >/dev/null 2>&1
+size=$(wc -c <"$STATE_FILE")
+head -c 100 /dev/zero | tr '\0' 'X' >>"$STATE_FILE"
+before=$(wc -c <"$STATE_FILE")
+out=$(STEELSERIES_STATE_MAX_BYTES=$size "$STEELSERIES" observe 0 --presets 800,1600 2>&1)
+check_contains "an oversized state file is refused rather than rewritten" \
+  "refusing to overwrite" "$out"
+check "the oversized state file is left exactly as it was" \
+  "$before" "$(wc -c <"$STATE_FILE")"
+teardown
+
+setup
+"$STEELSERIES" set --presets 800,1200 >/dev/null 2>&1
+size=$(wc -c <"$STATE_FILE")
+head -c 100 /dev/zero | tr '\0' 'X' >>"$STATE_FILE"
+: >"$CAPS_LOG"
+STEELSERIES_STATE_MAX_BYTES=$size "$STEELSERIES" get >/dev/null 2>&1
+check "an oversized state file is not mined for cached capabilities either" \
+  "1" "$(wc -l <"$CAPS_LOG")"
+teardown
+
+setup
+caps_size=$(printf '%s' "$CAPS_TABLE" | wc -c)
+check "a capabilities answer exactly at the ceiling is accepted" \
+  "true" \
+  "$(STEELSERIES_STDOUT_MAX_BYTES=$caps_size "$STEELSERIES" get | jq -r .connected)"
+teardown
+
+setup
+caps_size=$(printf '%s' "$CAPS_TABLE" | wc -c)
+printf '%s ' "$CAPS_TABLE" >"$CAPS_FILE"
+check "a capabilities answer one byte past the ceiling is refused" \
+  "false" \
+  "$(STEELSERIES_STDOUT_MAX_BYTES=$caps_size "$STEELSERIES" get | jq -r .connected)"
+teardown
+
+setup
+{ head -c 70000 /dev/zero | tr '\0' '#' | fold -w 100
+  printf 'DRIVER=hid-generic\nHID_ID=0003:00001038:00001836\n'; } \
+  >"$HIDRAW/hidraw0/device/uevent"
+check "a uevent is read under a ceiling like every other outside file" \
+  "false" "$("$STEELSERIES" get | jq -r .connected)"
+teardown
+
+setup
+{ printf 'DRIVER=hid-generic\nHID_ID=0003:00001038:00001836\n'
+  head -c 70000 /dev/zero | tr '\0' '#' | fold -w 100; } \
+  >"$HIDRAW/hidraw0/device/uevent"
+check "a padded uevent still matches on what fits under the ceiling" \
+  "true" "$("$STEELSERIES" get | jq -r .connected)"
+teardown
+
+setup
+out=$(STEELSERIES_STATE_MAX_BYTES="a[\$(touch $SANDBOX/pwned)]" "$STEELSERIES" get 2>&1)
+check_contains "a ceiling that is not a number is refused" \
+  "must be a positive whole number" "$out"
+check "a ceiling never reaches bash arithmetic as an expression" \
+  "" "$(ls "$SANDBOX/pwned" 2>/dev/null)"
+teardown
+
+# --- how many, not just what shape -----------------------------------------
+
+setup
+jq -n '{version:2,devices:{"1038:1836":{presets:[800,900,1000,1100,1200],
+  selected:0,polling:1000,appliedAt:"x",observedAt:"",error:""}}}' >"$STATE_FILE"
+check "a stored table exactly as long as the device holds is kept" \
+  "800 900 1000 1100 1200" \
+  "$("$STEELSERIES" get | jq -r '.presets | join(" ")')"
+teardown
+
+setup
+jq -n '{version:2,devices:{"1038:1836":{presets:[800,900,1000,1100,1200,1300],
+  selected:0,polling:1000,appliedAt:"x",observedAt:"",error:""}}}' >"$STATE_FILE"
+check "a stored table one longer than the device holds is refused" \
+  "800 1600" \
+  "$("$STEELSERIES" get | jq -r '.presets | join(" ")')"
+teardown
+
+setup
+# One chip per entry on the panel, and an execve argument past 128K before the
+# panel ever sees it. Shape alone says nothing about how many.
+jq -n '{version:2,devices:{"1038:1836":{presets:[range(20000)|800],
+  selected:0,polling:1000,appliedAt:"x",observedAt:"",error:""}}}' >"$STATE_FILE"
+out=$("$STEELSERIES" get 2>&1)
+check "a stored table of twenty thousand is refused, not emitted" \
+  "800 1600" "$(jq -r '.presets | join(" ")' <<<"$out" 2>/dev/null)"
+check_contains "and get still emits valid JSON rather than failing" \
+  '"connected":true' "$(jq -c '{connected}' <<<"$out" 2>/dev/null)"
+teardown
+
+setup
+"$STEELSERIES" set --presets 800,1200 >/dev/null 2>&1
+# Past the helper's ceiling but under the state file's, which is exactly where
+# the two used to disagree — and past what execve takes as one argument.
+jq '.capabilities.pad = ("A" * 70000)' "$STATE_FILE" >"$SANDBOX/padded.json"
+mv "$SANDBOX/padded.json" "$STATE_FILE"
+: >"$CAPS_LOG"
+out=$("$STEELSERIES" get 2>&1)
+check "an oversized cached capabilities blob is dropped, not passed on" \
+  "true" "$(jq -r 'has("pad") | not' <<<"$out" 2>/dev/null)"
+check "and the helper is asked again in its place" "1" "$(wc -l <"$CAPS_LOG")"
+teardown
+
+setup
+# Every mouse ever plugged in keeps an entry, so this map is the one value in
+# the state file that grows with use. Past 128K it no longer fits in a single
+# execve argument, and every write from then on would fail rather than any one.
+jq -n --argjson caps "$CAPS_TABLE" '{version:2,probeKey:"1038:1836",
+  capabilities:$caps,
+  devices:(reduce range(1300) as $i ({}; . + {("1038:\($i)"):
+    {presets:[800,1600],selected:0,polling:1000,
+     appliedAt:"x",observedAt:"",error:""}}))}' >"$STATE_FILE"
+check "the device map is large enough to matter" \
+  "yes" "$([ "$(jq -c .devices "$STATE_FILE" | wc -c)" -gt 131072 ] && echo yes)"
+"$STEELSERIES" observe 0 --presets 800,1600 >/dev/null 2>&1
+check "a large device map still writes, and keeps every entry" \
+  "1301" "$(jq '.devices | length' "$STATE_FILE" 2>/dev/null)"
+teardown
+
+# --- the watch stream ------------------------------------------------------
+
+setup
+cat >"$STUB_BIN/steelseries-device" <<'STUB'
+#!/usr/bin/env bash
+if [ "${1:-}" = capabilities ]; then cat "$CAPS_FILE"; exit 0; fi
+# One well-formed report, then a flood with no newline in it anywhere.
+printf '{"selected":0,"presets":[800,1600]}\n'
+head -c 20000 /dev/zero | tr '\0' 'A'
+STUB
+chmod +x "$STUB_BIN/steelseries-device"
+watched=$(STEELSERIES_LINE_MAX_BYTES=512 "$STEELSERIES" watch 2>/dev/null)
+check "a real report crosses the wrapper untouched" \
+  '{"selected":0,"presets":[800,1600]}' \
+  "$(head -1 <<<"$watched")"
+check "a newline-free flood is cut into lines the reader can bound" \
+  "512" \
+  "$(awk 'NR > 1 { print length($0); exit }' <<<"$watched")"
+teardown
+
+setup
+export STEELSERIES_DEVICE="$SANDBOX/bin/does-not-exist"
+out=$("$STEELSERIES" watch 2>&1)
+check_contains "watch without a device helper says so" "device helper not found" "$out"
+teardown
+
 # --- output contract -------------------------------------------------------
 
 setup
@@ -453,5 +613,16 @@ printf '\n%d passed, %d failed\n' "$pass" "$fail"
 echo
 echo "device helper:"
 python3 "$SCRIPT_DIR/tests/test_device.py" || fail=$((fail + 1))
+
+# The panel's own validation, lifted straight out of BarWidget.qml. Guarded
+# rather than required: nothing else here needs a JS engine, and the plugin
+# itself needs only the one already inside Quickshell.
+echo
+echo "panel:"
+if command -v node >/dev/null 2>&1; then
+  node "$SCRIPT_DIR/tests/test_panel.js" || fail=$((fail + 1))
+else
+  echo "  skipped — no node to run BarWidget.qml's own logic against"
+fi
 
 [ "$fail" -eq 0 ]

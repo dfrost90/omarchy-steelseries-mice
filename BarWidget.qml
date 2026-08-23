@@ -25,10 +25,11 @@ Panel {
   moduleName: "io.github.dfrost90.steelseries-mice"
   ipcTarget: "io.github.dfrost90.steelseries-mice"
 
+  // Everything this panel runs goes through the wrapper, the watch stream
+  // included. The wrapper is where the ceilings on helper output live, and a
+  // stream read straight from the helper would arrive under none of them.
   readonly property string script: Quickshell.env("HOME")
     + "/.config/omarchy/plugins/" + moduleName + "/scripts/steelseries"
-  readonly property string deviceScript: Quickshell.env("HOME")
-    + "/.config/omarchy/plugins/" + moduleName + "/scripts/steelseries-device"
 
   property var presets: [800, 1600]
   property int selected: 0
@@ -181,6 +182,12 @@ Panel {
   // leave the shell holding the result until logout.
   readonly property int maxPayloadBytes: 262144
   readonly property int maxMessageChars: 2000
+  // Every list here becomes one QML object per entry — a chip per preset, a
+  // button per polling rate. No device rivalcfg knows holds more than five
+  // presets, offers more than four polling rates, or lists more than eight DPI
+  // values, so this is far above anything real and far below the point where
+  // building the objects costs the shell anything.
+  readonly property int maxListLength: 64
 
   // Qt Text defaults to Text.AutoText, which sniffs the string and switches to
   // rich text if it looks like markup — and rich text loads external
@@ -195,18 +202,47 @@ Panel {
     return out.replace(/[<>&]/g, " ")
   }
 
+  // What plain() does for the strings, these do for the numbers.
+  //
+  // A DPI or a preset index is never run through plain() — it is a number, and
+  // numbers are safe. That holds only for as long as something checks that it
+  // is one. The wrapper checks on the way back in, but nothing is written back
+  // until after the panel has painted the report, and the labels it paints
+  // into are Text.AutoText: a preset that arrived as a string of markup would
+  // be laid out as rich text, which is the one thing this panel is careful
+  // never to do. A report the panel cannot read as numbers is a report from
+  // something that is not the mouse, so it is dropped whole.
+  function whole(value) {
+    return typeof value === "number" && isFinite(value)
+      && value >= 0 && value === Math.floor(value)
+  }
+
+  // The list, unchanged, or null if any of it is not a whole number. Empty
+  // counts as null: every list here describes something the device holds, and
+  // none of them are legitimately empty at the point they are checked.
+  function wholeList(list) {
+    if (!(list instanceof Array) || list.length === 0
+      || list.length > root.maxListLength) return null
+    for (var i = 0; i < list.length; i++)
+      if (!root.whole(list[i])) return null
+    return list
+  }
+
   function applyState(text) {
     var state = null
     // A get that came back enormous is a broken helper, not a big mouse.
     // Parsing it would retain it; dropping it costs one refresh.
     if (String(text).length > root.maxPayloadBytes) return
     try { state = JSON.parse(text) } catch (e) { return }
-    if (!state || !(state.presets instanceof Array)) return
+    if (!state) return
+    var presets = root.wholeList(state.presets)
+    if (presets === null) return
 
-    root.presets = state.presets
-    root.selected = state.selected
-    root.activeDpi = state.activeDpi
-    root.polling = state.polling
+    root.presets = presets
+    root.selected = root.whole(state.selected) && state.selected < presets.length
+      ? state.selected : 0
+    root.activeDpi = root.whole(state.activeDpi) ? state.activeDpi : presets[root.selected]
+    if (root.whole(state.polling)) root.polling = state.polling
     root.assumed = state.assumed === true
     root.connected = state.connected === true
     root.haveHelper = state.helper === true
@@ -215,17 +251,18 @@ Panel {
 
     if (state.name) root.deviceName = root.plain(state.name)
     if (state.mode) root.mode = root.plain(state.mode)
-    if (state.dpiMin > 0) root.dpiMin = state.dpiMin
-    if (state.dpiMax > 0) root.dpiMax = state.dpiMax
-    root.dpiStep = state.dpiStep > 0 ? state.dpiStep : 1
-    root.dpiValues = state.dpiValues instanceof Array ? state.dpiValues : []
-    if (state.presetMin > 0) root.presetMin = state.presetMin
-    if (state.presetMax > 0) root.presetMax = state.presetMax
+    if (root.whole(state.dpiMin) && state.dpiMin > 0) root.dpiMin = state.dpiMin
+    if (root.whole(state.dpiMax) && state.dpiMax > 0) root.dpiMax = state.dpiMax
+    root.dpiStep = root.whole(state.dpiStep) && state.dpiStep > 0 ? state.dpiStep : 1
+    // Legitimately empty on any device with a DPI range rather than a list.
+    root.dpiValues = root.wholeList(state.dpiValues) || []
+    if (root.whole(state.presetMin) && state.presetMin > 0) root.presetMin = state.presetMin
+    if (root.whole(state.presetMax) && state.presetMax > 0) root.presetMax = state.presetMax
     root.selectable = state.selectable === true
     root.tracking = state.tracking === true
     root.verified = state.verified === true
-    if (state.pollingOptions instanceof Array && state.pollingOptions.length > 0)
-      root.pollingOptions = state.pollingOptions.map(String)
+    var rates = root.wholeList(state.pollingOptions)
+    if (rates !== null) root.pollingOptions = rates.map(String)
 
     root.ready = true
   }
@@ -233,23 +270,28 @@ Panel {
   // A press of the physical DPI button arrives here as one JSON line.
   function observed(line) {
     var report = null
-    // SplitParser buffers until its marker arrives, so a helper emitting a
-    // long line without a newline would grow without bound. One report is a
-    // hundred bytes; anything of this size is not one.
+    // The ceiling that does the work is upstream, in `steelseries watch`:
+    // SplitParser buffers until its marker arrives and offers no bound of its
+    // own, so a check here cannot run until a newline has already come. This
+    // is the backstop for a line that arrives whole and still absurd — one
+    // report is a hundred bytes; anything of this size is not one.
     if (String(line).length > root.maxPayloadBytes) return
     try { report = JSON.parse(line) } catch (e) { return }
-    if (!report || !(report.presets instanceof Array)) return
+    if (!report) return
+    var presets = root.wholeList(report.presets)
+    if (presets === null) return
+    if (!root.whole(report.selected) || report.selected >= presets.length) return
 
     // The device just told us what it holds, which outranks a half-finished
     // scroll of ours.
     root.pendingPresets = null
     commitTimer.stop()
-    root.presets = report.presets
+    root.presets = presets
     root.selected = report.selected
-    root.activeDpi = report.presets[report.selected] || report.presets[0]
+    root.activeDpi = presets[report.selected]
     root.assumed = false
     // Persist it: the device is authoritative about its own table.
-    run(["observe", String(report.selected), "--presets", presetCsv(report.presets)])
+    run(["observe", String(report.selected), "--presets", presetCsv(presets)])
   }
 
   function statusLine() {
@@ -323,9 +365,15 @@ Panel {
   // Follows the physical DPI button for as long as the shell runs. The read
   // blocks in the helper, so this costs nothing while the button is idle, and
   // devices whose report layout we cannot decode never start it at all.
+  //
+  // Through the wrapper rather than the helper, because SplitParser below will
+  // hold whatever it is given until a newline turns up: the wrapper folds one
+  // in every few kilobytes so that buffer has a ceiling at all. `running`
+  // going false terminates the wrapper, which is the helper itself — it execs
+  // into it precisely so this stays true.
   Process {
     id: watchProc
-    command: [root.deviceScript, "watch"]
+    command: [root.script, "watch"]
     running: root.connected && root.tracking
     stdout: SplitParser {
       onRead: function(line) { root.observed(line) }

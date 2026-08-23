@@ -119,6 +119,10 @@ BarWidget.qml ──> scripts/steelseries ──> scripts/steelseries-device ─
 capabilities, writes through rivalcfg's library, and decodes DPI-button reports
 into JSON lines.
 
+The panel never runs the helper itself, the `watch` stream included. Everything
+the helper produces has a ceiling on it, and those ceilings live in the wrapper
+— a stream read straight from the helper would arrive under none of them.
+
 The split matters for speed. Deciding whether a supported mouse is plugged in
 costs a Python process and a rivalcfg import; deciding whether any SteelSeries
 USB id is present at all costs a `sed` over sysfs. The wrapper does the cheap
@@ -198,13 +202,19 @@ What remains are `Style`/`Color` singleton lookups and one Quickshell `Process`
 signal type that qmllint cannot introspect statically — the same warnings the
 first-party Omarchy plugins produce, in larger numbers.
 
-54 tests for the wrapper script and 34 for the device helper. The wrapper's
-device helper is stubbed and sysfs is faked, so the suite can never reach real
-hardware and can pretend any mouse is plugged in. The helper's tests use report
-fixtures captured from a real Aerox 3, then sweep all 76 profiles: capability
-derivation and payload building are pure functions of the profile, so a device
-nobody owns can still be checked for a missing field, a range that reads
-backwards, or a table the panel would render as an empty row.
+75 tests for the wrapper script, 34 for the device helper, and 16 for the
+panel. The wrapper's device helper is stubbed and sysfs is faked, so the suite
+can never reach real hardware and can pretend any mouse is plugged in. The
+helper's tests use report fixtures captured from a real Aerox 3, then sweep all
+76 profiles: capability derivation and payload building are pure functions of
+the profile, so a device nobody owns can still be checked for a missing field, a
+range that reads backwards, or a table the panel would render as an empty row.
+
+The panel's tests lift `applyState` and `observed` straight out of
+`BarWidget.qml` and feed them what a broken or replaced helper could say, so
+they cannot drift from the code they cover. They need `node` and are skipped
+without it — nothing else here wants a JS engine, and the plugin itself needs
+only the one already inside Quickshell.
 
 **Hot-reload is not reliable for structural QML changes.** The shell can keep
 serving a cached copy of `BarWidget.qml`, which looks like your edits silently
